@@ -26,6 +26,12 @@ if __name__ == "__main__":
 
         if sys.stdout is None or sys.stderr is None:  # windowed build has no console
             sys.stdout = sys.stderr = open(os.devnull, "w")
+        try:
+            import pyi_splash
+
+            pyi_splash.close()  # no splash for headless runs
+        except ImportError:
+            pass
         from schematic_netlist.cli import main as cli_main
 
         try:
@@ -38,6 +44,12 @@ if __name__ == "__main__":
                 f.write(traceback.format_exc())
             sys.exit(1)
     try:
+        try:
+            import pyi_splash
+
+            pyi_splash.update_text("Loading the application...")
+        except ImportError:
+            pass
         from schematic_netlist.gui import main
 
         main()
