@@ -37,6 +37,8 @@ except ImportError:
 _BaseTk = TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk
 
 APP_NAME = "SchematicNetlist"
+APP_ID = "SchematicNetlist.App"
+ICON = Path(__file__).resolve().parent / "assets" / "icon.ico"  # drawn by src/make_assets.py
 RUN_TEXT = "Analyze schematic"
 OUTPUT_LABELS = {
     "excel": "Excel analysis report (<name>_analysis.xlsx)",
@@ -300,6 +302,7 @@ class App(_BaseTk):
         self.geometry("640x640")
         self.minsize(640, 600)
         self._apply_theme()
+        self._set_icon()
 
         self.pdf_path: Optional[Path] = None
         self._out_dir: Optional[Path] = None
@@ -333,6 +336,17 @@ class App(_BaseTk):
             dark = ctypes.c_int(1)
             # DWMWA_USE_IMMERSIVE_DARK_MODE; ignored on Windows versions without it.
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
+
+    def _set_icon(self) -> None:
+        if sys.platform == "win32":
+            import ctypes
+
+            # own taskbar identity: without it a source run is grouped under (and shows) python.exe's icon
+            with contextlib.suppress(OSError, AttributeError):
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        if ICON.exists():
+            with contextlib.suppress(tk.TclError):
+                self.iconbitmap(default=str(ICON))  # title bar + taskbar, inherited by dialogs
 
     def _build_ui(self) -> None:
         pad = {"padx": 15, "pady": 5}
@@ -596,8 +610,20 @@ class App(_BaseTk):
         self.log_box.config(state="disabled")
 
 
+def _close_splash() -> None:
+    """The exe shows a splash image while unpacking (see build_exe.py); drop it once the window is up."""
+    try:
+        import pyi_splash  # only exists inside the PyInstaller build
+    except ImportError:
+        return
+    with contextlib.suppress(Exception):
+        pyi_splash.close()
+
+
 def main() -> None:
     app = App()
+    app.update_idletasks()
+    app.after(0, _close_splash)
     app.mainloop()
 
 

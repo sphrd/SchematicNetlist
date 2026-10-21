@@ -14,23 +14,30 @@ from pathlib import Path
 import PyInstaller.__main__
 from PyInstaller.depend import bindepend
 
+import make_assets
 from schematic_netlist.image_extract import TESSERACT_ZIP, find_tesseract
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
 NAME = "SchematicNetlist"
+ASSETS = make_assets.ASSETS
 # unused parts of big libraries: every byte is unpacked again at each start of a one-file exe
 DROP_BINARIES = ("opencv_videoio_ffmpeg",)
 EXCLUDE_MODULES = ["PIL._avif"]
 
+# Splash: drawn by the bootloader BEFORE the one-file archive is unpacked (the ~9 s of "nothing"),
+# its text line shows the unpack progress, gui.main() closes it once the window is mapped.
 SPEC = """
 from PyInstaller.utils.hooks import collect_all
 datas, binaries, hidden = collect_all("tkinterdnd2")
-a = Analysis([{script!r}], datas=datas + [({zip!r}, ".")], binaries=binaries,
-             hiddenimports=hidden, excludes={excludes!r})
+a = Analysis([{script!r}], datas=datas + [({zip!r}, "."), ({assets!r}, "schematic_netlist/assets")],
+             binaries=binaries, hiddenimports=hidden, excludes={excludes!r})
 a.binaries = [b for b in a.binaries if not any(d in b[0] for d in {drop!r})]
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name={name!r}, console=False, upx=False)
+splash = Splash({splash!r}, binaries=a.binaries, datas=a.datas, text_pos={text_pos!r}, text_size=10,
+                text_color="#aab4c0", text_default="Unpacking...", minify_script=True, always_on_top=False)
+exe = EXE(pyz, a.scripts, splash, splash.binaries, a.binaries, a.datas, [], name={name!r}, console=False,
+          upx=False, icon={icon!r})
 """
 
 
@@ -53,6 +60,7 @@ def main() -> None:
     if not tess:
         sys.exit("Tesseract not found -- install it first: winget install UB-Mannheim.TesseractOCR")
     tess = Path(tess)
+    make_assets.main()
     BUILD.mkdir(exist_ok=True)
     zip_path = BUILD / TESSERACT_ZIP
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -62,7 +70,8 @@ def main() -> None:
     spec = BUILD / f"{NAME}.spec"
     spec.write_text(SPEC.format(
         script=str(ROOT / "src" / "gui_app.py"), zip=str(zip_path), excludes=EXCLUDE_MODULES,
-        drop=DROP_BINARIES, name=NAME,
+        drop=DROP_BINARIES, name=NAME, assets=str(ASSETS), splash=str(ASSETS / "splash.png"),
+        text_pos=make_assets.SPLASH_TEXT_POS, icon=str(ASSETS / "icon.ico"),
     ))
     PyInstaller.__main__.run([str(spec), "--noconfirm", "--distpath", str(ROOT / "dist"), "--workpath", str(BUILD)])
     shutil.move(ROOT / "dist" / f"{NAME}.exe", ROOT / f"{NAME}.exe")
