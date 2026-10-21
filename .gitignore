@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+.ruff_cache/
+
+# never commit schematics or results
+*.pdf
+test_out/
+*_analysis.xlsx
+*_netlist.txt
+*_netlist.json
+*_engine_log.txt
+*.sp
+
+SchematicNetlist.exe
