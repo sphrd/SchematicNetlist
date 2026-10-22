@@ -24,30 +24,26 @@ def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.I
 
 
 def draw_icon(size: int = 256) -> Image.Image:
-    """Blue rounded tile with a white document carrying a small net: wires, a junction dot, pins."""
+    """Dark rounded tile with an accent-blue net: a bus, three branches, junction and pin dots.
+    Deliberately NOT a blue tile with a document, so it is told apart from similar tools at 16 px."""
     s = 4  # supersample for smooth edges at small sizes
     n = size * s
     img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((0, 0, n - 1, n - 1), radius=n * 0.22, fill=ACCENT)
+    d.rounded_rectangle((0, 0, n - 1, n - 1), radius=n * 0.22, fill=BG, outline=ACCENT, width=max(1, int(n * 0.03)))
 
-    # document with a folded corner
-    x0, y0, x1, y1 = n * 0.26, n * 0.17, n * 0.74, n * 0.83
-    fold = n * 0.14
-    d.polygon([(x0, y0), (x1 - fold, y0), (x1, y0 + fold), (x1, y1), (x0, y1)], fill=FG)
-    d.polygon([(x1 - fold, y0), (x1 - fold, y0 + fold), (x1, y0 + fold)], fill="#cfe4ff")
-
-    # a wire with a T-junction dot and three pins ending in nodes
-    line_w = max(1, int(n * 0.045))
-    r = n * 0.035
-    bus_x = n * 0.40
-    d.line((bus_x, n * 0.40, bus_x, n * 0.72), fill=BG, width=line_w)
-    for y in (0.44, 0.56, 0.68):
+    line_w = max(1, int(n * 0.07))
+    bus_x = n * 0.33
+    ys = (0.30, 0.50, 0.70)
+    d.line((bus_x, n * ys[0], bus_x, n * ys[-1]), fill=ACCENT, width=line_w)
+    for y in ys:
         yy = n * y
-        xb = n * 0.62
-        d.line((bus_x, yy, xb, yy), fill=BG, width=line_w)
-        d.ellipse((xb - r, yy - r, xb + r, yy + r), fill=ACCENT, outline=BG, width=max(1, line_w // 2))
-    d.ellipse((bus_x - r, n * 0.56 - r, bus_x + r, n * 0.56 + r), fill=BG)
+        xb = n * 0.70
+        d.line((bus_x, yy, xb, yy), fill=ACCENT, width=line_w)
+        r = n * 0.065
+        d.ellipse((xb - r, yy - r, xb + r, yy + r), fill=FG)
+    r = n * 0.06
+    d.ellipse((bus_x - r, n * 0.50 - r, bus_x + r, n * 0.50 + r), fill=ACCENT)  # T-junction dot
     return img.resize((size, size), Image.LANCZOS)
 
 
