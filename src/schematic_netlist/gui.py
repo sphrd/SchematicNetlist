@@ -301,8 +301,8 @@ class App(_BaseTk):
         self.title(APP_NAME)
         self.geometry("640x640")
         self.minsize(640, 600)
+        self._set_icon()  # before the window is first shown: the taskbar reads the icon only once
         self._apply_theme()
-        self._set_icon()
 
         self.pdf_path: Optional[Path] = None
         self._out_dir: Optional[Path] = None
