@@ -16,3 +16,6 @@ test_out/
 *.sp
 
 SchematicNetlist.exe
+
+# local working notes
+.notes/
