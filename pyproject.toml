@@ -1,6 +1,6 @@
 [project]
 name = "schematic-netlist"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read a schematic PDF (vector or scanned) into components, nets, an HSPICE netlist and an Excel analysis report."
 readme = "README.md"
 license = { file = "LICENSE" }
