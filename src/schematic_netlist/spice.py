@@ -120,7 +120,7 @@ def write_spice(circuit: Circuit, title: str) -> str:
     parts_by_group: dict[str, list[Part]] = defaultdict(list)
     for part in circuit.parts:
         parts_by_group[part.group].append(part)
-        if part.kind == "relay coil" and part.pin_count == 2:
+        if part.kind == "relay coil" and part.pin_count >= 2:
             a, b = (node(p.net) for p in _pins_in_order(part)[:2])
             coil_nodes[part.group] = (a, b)
 
@@ -172,7 +172,7 @@ def write_spice(circuit: Circuit, title: str) -> str:
     for part in circuit.parts:
         k = part.kind
         n = part.pin_count
-        if k in ("connector", "test point"):
+        if k in ("connector", "test point", "fiducial", "mechanical"):
             comments.append(f"* {k} {part.refdes}" + (f" ({part.value})" if part.value else "") + ": " + ", ".join(
                 f"{p.number or '?'}" + (f"/{p.name}" if p.name else "") + f"={node(p.net)}" for p in _pins_in_order(part)))
             continue
@@ -183,6 +183,9 @@ def write_spice(circuit: Circuit, title: str) -> str:
             a, b = nodes(part, 2)
             tag = "" if k == "resistor" else f"  $ {k}"
             lines.append(f"{_instance('R', part.refdes)} {a} {b} {val(part)}{tag}")
+        elif k == "relay coil" and n > 2:
+            a, b = nodes(part, 2)
+            lines.append(f"{_instance('R', part.refdes)} {a} {b} {val(part)}  $ relay coil on the two lowest pins of {pin_doc(part)}; the others are left open")
         elif k == "capacitor" and n == 2:
             a, b = nodes(part, 2)
             lines.append(f"{_instance('C', part.refdes)} {a} {b} {val(part)}")
