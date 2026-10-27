@@ -25,7 +25,7 @@ from typing import Optional
 
 from .netlist import PINNUM_RE, REFDES_RE, VALUE_RE, Component, Design, Grid, Word, _bbox_gap
 
-REF_PARTS = re.compile(r"^([A-Z]+)(\d+)(?:[_-](\d+))?([A-Z])?$")
+REF_PARTS = re.compile(r"^([A-Z]+)(\d+)(?:[_-](\d+))?([A-Z]{1,4})?$")
 # 10k, 4k7, 100n, 100nF, 2.2uF, 0R, 1R0, 10m, 1%, 1/4W, 100 ...
 VALUE_WORD_RE = re.compile(
     r"^(?:\d+(?:\.\d+)?\s*[pnuµmkKMGR]?(?:F|H|Ω|ohm|OHM|R|V|W|A|Hz|HZ|MHz|MHZ|kHz|KHZ)?\d*"
@@ -59,6 +59,8 @@ _PREFIX_KINDS: list[tuple[str, set[str]]] = [
     ("switch", {"SW", "S"}),
     ("fuse", {"F", "FU"}),
     ("test point", {"TP"}),
+    ("fiducial", {"FID", "FD"}),
+    ("mechanical", {"MH", "MTG", "MP"}),
     ("crystal", {"Y", "XTAL", "XT"}),
     ("transformer", {"T", "TR"}),
     ("battery", {"BT", "B"}),
@@ -152,11 +154,25 @@ def refdes_parts(refdes: str) -> tuple[str, int, Optional[str], Optional[str]]:
 
 def classify(c: Component) -> tuple[str, str]:
     """(kind, prefix) of a symbol cluster from its first refdes and its drawn shape."""
-    prefix = refdes_parts(c.refdes[0])[0] if c.refdes else ""
-    kind = _KIND_OF_PREFIX.get(prefix) or _KIND_OF_LETTER.get(prefix[:1], "unknown")
+    refdes = c.refdes[0] if c.refdes else ""
+    prefix = refdes_parts(refdes)[0] if refdes else ""
+    kind = _KIND_OF_PREFIX.get(prefix)
+    if not REF_PARTS.match(refdes) and re.search(r"(?:^|_)TP(?:\d|_|$)", refdes):
+        kind = "test point"  # free-form names such as TP_REF_1 (the prefix letter means nothing)
+    if kind is None and len(prefix) > 2:
+        # an unknown long prefix starting with a known multi-letter one (THERM -> TH)
+        known = [p for p in _KIND_OF_PREFIX if len(p) > 1 and prefix.startswith(p)]
+        if known:
+            kind = _KIND_OF_PREFIX[max(known, key=len)]
+    if kind is None:
+        kind = _KIND_OF_LETTER.get(prefix[:1], "unknown")
     n = len(c.terminals)
     blade = not c.is_box and 1 <= c.shape.get("D", 0) <= 2  # one slanted stroke: a contact, not a zigzag resistor
     if kind == "relay":
+        if c.is_zigzag:
+            return "resistor", prefix  # RL / RY also name load resistors; the drawn zigzag decides
+        if c.is_diode:
+            return "relay coil", prefix  # LED of a solid-state relay: its control side
         if blade and n >= 2:
             return "relay contact", prefix
         if c.is_coil or (not c.is_box and n == 2):
@@ -166,6 +182,12 @@ def classify(c: Component) -> tuple[str, str]:
         return "switch", prefix
     if kind == "unknown" and c.is_coil:
         return "inductor", prefix
+    if kind == "unknown" and c.is_zigzag:
+        return "resistor", prefix
+    if kind == "unknown" and c.is_diode:
+        return "diode", prefix
+    if kind == "unknown" and c.is_box and n >= 3:
+        return "block", prefix  # hierarchical block / sheet symbol
     if kind in ("connector", "IC") and not c.is_box and n == 2 and prefix in ("P", "X"):
         return "unknown", prefix  # a 2-pin P/X drawn as a plain symbol is rarely a connector
     return kind, prefix
@@ -201,9 +223,9 @@ def _assign_values(d: Design, part_of: dict[tuple[int, int], Part]) -> None:
     """Value (passives) or part number (everything else) per symbol: the nearest free text to the
     part's refdes word -- values are printed as a block with the refdes -- else to its body.
     Ratings (50V, 1/4W, 1%) and package codes (0603) rank behind a real value."""
-    S = d.scale
-    gap_max = VALUE_GAP * S
     for pi, pn in enumerate(d.pages):
+        S = pn.scale
+        gap_max = VALUE_GAP * S
         free = [k for k, w in enumerate(pn.words) if not w.role and re.search(r"[A-Za-z0-9]", w.text) and not REFDES_RE.match(w.text)]
         if not free:
             continue
@@ -299,6 +321,8 @@ def build_circuit(d: Design, source: str = "") -> Circuit:
             if c.refdes:
                 pr, num, inst, _unit = refdes_parts(c.refdes[0])
                 part.group = f"{pr}{num}" + (f"_{inst}" if inst else "")
+            if kind == "relay coil" and c.is_diode:
+                part.notes.append("drawn as a LED: control input of a solid-state relay")
         elif part.kind != kind and kind != "unknown":
             part.notes.append(f"drawn as {kind} on page {d.pages[pi].page}")
         part_of[(pi, ci)] = part
@@ -309,6 +333,20 @@ def build_circuit(d: Design, source: str = "") -> Circuit:
             t = pn.terminals[ti]
             part.pins.append(Pin(t.pin or "", t.pin_name or "", names[d.gnet(pi, t.net)], pn.page))
     _assign_values(d, part_of)
+
+    # a relay drawn in pieces: the boxed unit next to blade contacts is the coil (a coil in a
+    # rectangle, often with extra shield / unused pins), not a whole relay
+    groups: dict[str, list[Part]] = defaultdict(list)
+    for part in parts.values():
+        if part.kind.startswith("relay"):
+            groups[part.group].append(part)
+    for members in groups.values():
+        kinds = {m.kind for m in members}
+        if "relay contact" in kinds and "relay coil" not in kinds:
+            boxed = [m for m in members if m.kind == "relay" and m.is_box]
+            if len(boxed) == 1:
+                boxed[0].kind = "relay coil"
+                boxed[0].notes.append(f"coil drawn as a box with {boxed[0].pin_count} pins")
 
     # nets
     nets: dict[tuple, Net] = {}
@@ -340,16 +378,18 @@ def build_circuit(d: Design, source: str = "") -> Circuit:
     for part in parts.values():
         missing = sum(1 for p in part.pins if not p.number)
         if part.is_box and missing:
-            warnings.append(Warning_("warn", part.pages[0], f"{part.refdes}: {missing} of {len(part.pins)} pins have no pin number"))
+            # a symbol with no number printed at all (IEC resistor rectangle, test point, block) is the drawing's style
+            level = "info" if missing == len(part.pins) else "warn"
+            warnings.append(Warning_(level, part.pages[0], f"{part.refdes}: {missing} of {len(part.pins)} pins have no pin number"))
         dup = [k for k, v in Counter(p.number for p in part.pins if p.number).items() if v > 1]
         if dup:
             nets_of = {num: {p.net for p in part.pins if p.number == num} for num in dup}
             clash = {k: v for k, v in nets_of.items() if len(v) > 1}
             if clash:
                 warnings.append(Warning_("warn", part.pages[0], f"{part.refdes}: pin(s) {sorted(clash)} appear on different nets: {clash}"))
-        if part.kind in TWO_PIN_KINDS and part.pin_count != 2:
+        if part.kind in TWO_PIN_KINDS and part.pin_count != 2 and not (part.kind == "relay coil" and part.is_box):
             warnings.append(Warning_("info", part.pages[0], f"{part.refdes} ({part.kind}) has {part.pin_count} pins"))
-    groups: dict[str, list[Part]] = defaultdict(list)
+    groups = defaultdict(list)
     for part in parts.values():
         if part.kind.startswith("relay"):
             groups[part.group].append(part)
@@ -372,7 +412,9 @@ def build_circuit(d: Design, source: str = "") -> Circuit:
         part.pins.sort(key=_pin_sort_key)
     kinds = circuit.kinds()
     src = Counter(circuit.page_source.values())
-    log.insert(0, f"{len(circuit.pages)} page(s) read ({dict(src)}), drawing scale {d.scale:g}")
+    sizes = sorted({round(pn.text_size, 2) for pn in d.pages if pn.text_size})
+    ts = f"{sizes[0]:g}" if len(sizes) == 1 else (f"{sizes[0]:g}-{sizes[-1]:g}" if sizes else "none")
+    log.insert(0, f"{len(circuit.pages)} page(s) read ({dict(src)}), drawing text height {ts} pt (tolerance unit)")
     log.insert(1, f"{len(circuit.parts)} parts: " + ", ".join(f"{k} {v}" for k, v in kinds.most_common()))
     log.insert(2, f"{len(circuit.nets)} nets with pins, {len(circuit.rails)} power/ground rails: "
                   + ", ".join(n.name for n in circuit.rails[:12]))

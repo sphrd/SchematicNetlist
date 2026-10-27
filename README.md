@@ -31,11 +31,19 @@ Results go to a folder **named after the PDF, next to it** (`Board.pdf` → `Boa
 
 The engine works on the **vector drawing** of the PDF, the way every ECAD tool exports it:
 
-* orthogonal line segments are wires; they join at shared endpoints and at T-junctions that
-  carry a junction dot (a pin ending on a symbol edge has no dot and is *not* a connection);
-* curves, diagonals and boxes are symbol bodies; a wire ending on one is a pin;
+* orthogonal line segments are wires (a wire placed a hair off-grid, under 2° of slant, is
+  still a wire); they join at shared endpoints and at T-junctions that carry a junction dot (a
+  pin ending on a symbol edge has no dot and is *not* a connection; pin-direction arrowheads on
+  a box edge are not dots);
+* curves, diagonals, triangles and boxes are symbol bodies; a wire ending on one is a pin.
+  Graphics drawn *inside* a box symbol (a coil in its rectangle, an internal switch diagram,
+  polarity marks) are body, never wires; a small "×" at a wire end is a no-connect mark;
 * reference designators, pin numbers, pin names (inside boxes) and net labels are placed by
-  position; equal net labels join nets across pages;
+  position, rotated text included; equal net labels join nets across pages. When the drawing
+  prints designators in their own colour, free-form names in that colour (`R_SHUNT_1`,
+  `J1PWR`, `TP_REF_3`) count as designators too;
+* a box with several pins and a title at its top-left corner, or with numbered pins, is a
+  hierarchical **block** (sheet symbol) even without a designator;
 * **scanned / image-only pages** are read with OpenCV + Tesseract OCR into the same model
   (less reliable — the log lists those pages).
 
@@ -43,23 +51,23 @@ On top of that, `circuit.py` adds the circuit meaning:
 
 | | Rule |
 |---|---|
-| Part kind | refdes prefix (`R`, `C`, `L`, `D`, `Q`, `M`, `U`, `K`, `J`, `SW`, `F`, `TP`, `Y`, …), confirmed or overridden by the drawn shape (slanted blade = switch/relay contact, arcs only = coil) |
+| Part kind | refdes prefix (`R`, `C`, `L`, `D`, `Q`, `M`, `U`, `K`, `J`, `SW`, `F`, `TP`, `Y`, …), confirmed or overridden by the drawn shape (slanted blade = switch/relay contact, arcs only = coil, zigzag = resistor, triangle = diode / solid-state relay input). A boxed unit of a relay whose other units are contacts is its coil. Boxes without a known prefix are blocks |
 | Value / part | nearest free text that looks like a value (`10k`, `4k7`, `100nF`) for passives; nearest part-number-like text for everything else |
 | Net name | the net label; with several aliases the most used one (rail names win); unlabeled nets are `N<page>_<n>` |
 | Power / ground | by name (`GND`, `VCC`, `VDD`, `+5V`, `3V3`, …) or, unnamed, by being ≥ 5× bigger than the document's 99th-percentile net (≥ 50 pins) |
-| Warnings | unnamed connector flags, single-pin nets, box pins without numbers, a pin on two nets, relay contacts without a coil, nets with conflicting labels |
+| Warnings | unnamed connector flags, single-pin nets, box pins without numbers (info when the symbol prints none at all), a pin on two nets, relay contacts without a coil, nets with conflicting labels |
 
 ### HSPICE mapping
 
 | Part kind | Element |
 |---|---|
-| resistor, fuse, jumper, switch, relay coil | `R` (`.PARAM` when no value; switch `1m` = closed) |
+| resistor, fuse, jumper, switch, relay coil | `R` (`.PARAM` when no value; switch `1m` = closed). A boxed coil with extra pins: `R` on its two lowest-numbered pins |
 | capacitor / inductor, ferrite bead | `C` / `L` |
 | diode, BJT, MOSFET | `D`, `Q`, `M` with a stub `.MODEL`; pin order = pin numbers (comment says so — check it) |
 | relay contact | `S` switch controlled by the coil nodes of the same relay (`K5_1A` contact ↔ `K5_1C` coil) |
 | source / battery | `V` |
-| IC, networks, crystals, transformers, odd pin counts | `X` instance of an empty `.SUBCKT` whose pins are documented |
-| connector, test point | comment lines (`pin = node`) |
+| IC, blocks, networks, crystals, transformers, odd pin counts | `X` instance of an empty `.SUBCKT` whose pins are documented |
+| connector, test point, fiducial, mechanical | comment lines (`pin = node`) |
 
 Nets named `GND`/`0V` become node `0`; other rails go to `.GLOBAL`.
 
@@ -96,7 +104,7 @@ Pages are read in parallel processes and the extracted netlist is cached in
 `%LOCALAPPDATA%\SchematicNetlist\cache` (keyed by PDF content + engine code), so a re-run of
 the same PDF takes seconds.
 
-Build the exe (bundles Tesseract, ~90 MB): `.venv\Scripts\python.exe src\build_exe.py`.
+Build the exe (bundles Tesseract, ~110 MB): `.\build.ps1` (first time `.\build.ps1 -Setup` creates `.venv`) -> `.\SchematicNetlist.exe`.
 Headless use of the exe: `SchematicNetlist.exe --cli analyze board.pdf`.
 
 ### Layout
