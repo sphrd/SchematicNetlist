@@ -35,7 +35,7 @@ a = Analysis([{script!r}], datas=datas + [({zip!r}, "."), ({assets!r}, "schemati
 a.binaries = [b for b in a.binaries if not any(d in b[0] for d in {drop!r})]
 pyz = PYZ(a.pure)
 splash = Splash({splash!r}, binaries=a.binaries, datas=a.datas, text_pos={text_pos!r}, text_size=10,
-                text_color="#aab4c0", text_default="Unpacking...", minify_script=True, always_on_top=False)
+                text_color="#aab4c0", text_default="Starting...", minify_script=False, always_on_top=False)
 exe = EXE(pyz, a.scripts, splash, splash.binaries, a.binaries, a.datas, [], name={name!r}, console=False,
           upx=False, icon={icon!r})
 """
@@ -73,6 +73,9 @@ def main() -> None:
         drop=DROP_BINARIES, name=NAME, assets=str(ASSETS), splash=str(ASSETS / "splash.png"),
         text_pos=make_assets.SPLASH_TEXT_POS, icon=str(ASSETS / "icon.ico"),
     ))
+    from schematic_netlist import appshell
+
+    appshell.patch_splash_template()  # live loading log + divider sweep (App Engineer 2.4)
     PyInstaller.__main__.run([str(spec), "--noconfirm", "--distpath", str(ROOT / "dist"), "--workpath", str(BUILD)])
     shutil.move(ROOT / "dist" / f"{NAME}.exe", ROOT / f"{NAME}.exe")
     shutil.rmtree(ROOT / "dist")

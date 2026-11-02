@@ -27,6 +27,11 @@ Results go to a folder **named after the PDF, next to it** (`Board.pdf` → `Boa
 | `<name>_netlist.txt` / `.json` | flat connectivity netlist, human-readable and machine-readable |
 | `<name>_engine_log.txt` | what the engine found and what it could not resolve |
 
+**Updates:** 3 s after start the app checks GitHub for a newer release and offers it:
+**Update now** downloads and checks it, replaces the exe in place, and **Restart now** opens
+the new version. **Check for updates** in the title bar checks on demand; **About** (<kbd>F1</kbd>)
+shows the version. The update check is the only network access.
+
 ## What it reads
 
 The engine works on the **vector drawing** of the PDF, the way every ECAD tool exports it:
@@ -34,16 +39,25 @@ The engine works on the **vector drawing** of the PDF, the way every ECAD tool e
 * orthogonal line segments are wires (a wire placed a hair off-grid, under 2° of slant, is
   still a wire); they join at shared endpoints and at T-junctions that carry a junction dot (a
   pin ending on a symbol edge has no dot and is *not* a connection; pin-direction arrowheads on
-  a box edge are not dots);
+  a box edge, thin hollow contact rings and slim dashes are not dots); dashed lines, outlines
+  drawn over the wiring around connector flags and large outlines around a sub-circuit are
+  graphics, not wires or symbols; a narrow empty rectangle with a junction dot on a corner is a
+  wire loop; a wire ending in front of a pin line's tip, with the pin number in the gap, meets
+  that pin;
 * curves, diagonals, triangles and boxes are symbol bodies; a wire ending on one is a pin.
   Graphics drawn *inside* a box symbol (a coil in its rectangle, an internal switch diagram,
-  polarity marks) are body, never wires; a small "×" at a wire end is a no-connect mark;
+  an amplifier triangle, polarity marks) are body, never wires; a small "×" at a wire end is a
+  no-connect mark; a short bar with free parallel prongs is a ground symbol drawn in lines;
 * reference designators, pin numbers, pin names (inside boxes) and net labels are placed by
   position, rotated text included; equal net labels join nets across pages. When the drawing
   prints designators in their own colour, free-form names in that colour (`R_SHUNT_1`,
-  `J1PWR`, `TP_REF_3`) count as designators too;
-* a box with several pins and a title at its top-left corner, or with numbered pins, is a
-  hierarchical **block** (sheet symbol) even without a designator;
+  `J1PWR`, `TP_REF_3`) count as designators too; the line under a designator is its value;
+  units of one part drawn touching (`K3A` / `K3B`) are one symbol, and separate one-pin parts
+  drawn touching (two test points) stay separate;
+* a box with several pins and a title at its top-left corner, a name written inside it, or
+  numbered pins, is a **block** (sheet symbol / unannotated device) even without a designator
+  (named by its title, else `BOX<page>.<n>`); placeholder designators of an unannotated draft
+  (`R?`, `U?`) make parts too, named `R?<page>.<n>`;
 * **scanned / image-only pages** are read with OpenCV + Tesseract OCR into the same model
   (less reliable — the log lists those pages).
 
@@ -105,7 +119,22 @@ Pages are read in parallel processes and the extracted netlist is cached in
 the same PDF takes seconds.
 
 Build the exe (bundles Tesseract, ~110 MB): `.\build.ps1` (first time `.\build.ps1 -Setup` creates `.venv`) -> `.\SchematicNetlist.exe`.
-Headless use of the exe: `SchematicNetlist.exe --cli analyze board.pdf`.
+Headless use of the exe: `SchematicNetlist.exe --cli analyze board.pdf`; `--cli update [--restart]`
+updates the exe in place from the latest release. `SchematicNetlist.exe --splash` shows the
+start-up splash until it is clicked or Esc is pressed.
+
+### Tests
+
+`tests/corpus/` scores the engine against exact netlists: KiCad's demo projects exported to PDF
+with their KiCad netlists, plus black-and-white and 0.4x / 3x rescaled copies (the netlist must
+not depend on the drawing size).
+
+```powershell
+.venv\Scripts\python.exe tests\corpus\build_corpus.py   # needs KiCad; writes tests\corpus\cases\ (git-ignored)
+.venv\Scripts\python.exe tests\corpus\par.py base       # parts / pins / connection precision and recall per project
+.venv\Scripts\python.exe tests\corpus\par.py var        # the rescaled and black-and-white copies
+.venv\Scripts\python.exe tests\corpus\dump.py <pdf> <page>   # what the engine read on one page
+```
 
 ### Layout
 

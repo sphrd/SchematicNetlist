@@ -16,6 +16,17 @@ def _fatal(message: str) -> None:
         print(message, file=sys.stderr)
 
 
+def _step(text: str) -> None:
+    """A new line in the bundled exe's splash log; no-op in a source run or once the splash closed."""
+    try:
+        import pyi_splash  # pyright: ignore[reportMissingModuleSource]
+
+        if pyi_splash.is_alive():
+            pyi_splash.update_text(text)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     import multiprocessing
 
@@ -35,6 +46,11 @@ if __name__ == "__main__":
         from schematic_netlist.cli import main as cli_main
 
         try:
+            if sys.argv[2:3] == ["update"]:  # SchematicNetlist.exe --cli update [--restart]
+                from schematic_netlist import appshell
+                from schematic_netlist.gui import APP_INFO
+
+                sys.exit(appshell.cli_update(APP_INFO, restart="--restart" in sys.argv))
             sys.exit(cli_main(sys.argv[2:]))
         except SystemExit:
             raise
@@ -44,12 +60,27 @@ if __name__ == "__main__":
                 f.write(traceback.format_exc())
             sys.exit(1)
     try:
-        try:
-            import pyi_splash
+        # every step is a line in the splash's loading log (what is being loaded right now)
+        _step("Starting Python")
+        import importlib
 
-            pyi_splash.update_text("Loading the application...")
-        except ImportError:
-            pass
+        for text, modules in (
+            ("Loading the PDF libraries", "pdfplumber pypdfium2 PIL.Image"),
+            ("Loading the schematic engine", "schematic_netlist.netlist schematic_netlist.circuit schematic_netlist.analyze"),
+            ("Loading the Excel writer", "openpyxl"),
+            ("Loading the window toolkit", "tkinter tkinterdnd2"),
+            ("Loading the user interface", "schematic_netlist.appshell schematic_netlist.gui"),
+        ):
+            _step(text)
+            for m in modules.split():
+                try:
+                    importlib.import_module(m)
+                except ImportError:
+                    pass
+        if "--splash" in sys.argv[1:]:  # preview: the splash only, until clicked or Esc
+            from schematic_netlist import appshell
+
+            sys.exit(appshell.splash_preview(["pdfplumber", "pypdfium2", "PIL", "openpyxl", "tkinter", "schematic_netlist"]))
         from schematic_netlist.gui import main
 
         main()
