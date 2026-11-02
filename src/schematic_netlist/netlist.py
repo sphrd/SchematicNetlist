@@ -32,10 +32,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-# Every geometric tolerance is relative to the page's own drawing: schematic CAD tools size text,
-# pin spacing and symbols together, so the height of the page's legible text is the unit. The
-# constants below are written in PDF points for TEXT_UNIT-pt text; build_page() multiplies them by
-# Primitives.scale = (this page's text height) / TEXT_UNIT. E.g. TOL = 0.085 text heights.
+# Every geometric tolerance is relative to the drawing: schematic CAD tools size text, pin spacing
+# and symbols together, so the height of the document's legible text is the unit -- the lower median
+# over its pages, as one page may set all its text smaller (a dense connector table) on the same grid.
+# The constants below are written in PDF points for TEXT_UNIT-pt text; build_page() multiplies them
+# by Primitives.scale = (text height) / TEXT_UNIT. E.g. TOL = 0.085 text heights.
 TEXT_UNIT = 4.1
 LEGIBLE_MIN = 0.4  # text under this fraction of the page's large text is hidden/annotation, not drawing text
 TEXT_MIN = 0.6  # text under this fraction of the page's large text does not set the page's text height
@@ -64,10 +65,13 @@ REFDES_LONG_RE = re.compile(r"^[A-Z]{1,3}\d{1,4}[A-Z]{2,4}$")
 REFDES_MIXED_RE = re.compile(r"^[A-Z](?=[A-Za-z]*[a-z])[A-Za-z]{1,6}\d{1,3}$")
 # free-form designators (R_SHUNT_1, SOCKET2, TP_A_1): letters, digits and underscores with at
 # least one digit; accepted only in the document's refdes colour
-REFDES_LOOSE_RE = re.compile(r"^(?=.*\d)[A-Z][A-Z0-9]{0,7}(?:_[A-Z0-9]{1,6}){0,2}$")
+REFDES_LOOSE_RE = re.compile(r"^(?=.*\d)[A-Z](?:[A-Z0-9]{0,7}(?:_[A-Z0-9]{1,6}){0,2}|[A-Z0-9]{8,11}(?:_[A-Z0-9]{1,6}){1,2})$")
+# designator of a part not yet annotated (R?, C?, U?): a part all the same, named per page
+PLACEHOLDER_RE = re.compile(r"^[A-Z]{1,3}\?$")
 # refdes with an instance suffix (K5_2A: part K5, instance 2, unit A) -- multi-channel/multi-copy designs
 SUFFIXED_REFDES_RE = re.compile(r"^[A-Z]{1,3}\d{1,4}[A-Z]?_\d{1,3}[A-Z]?$")
 PINNUM_RE = re.compile(r"^(?:[A-Z]{0,2}\d{1,3}[A-Z]?|[A-Z]{1,2})$")
+PIN_WORD_RE = re.compile(r"^[A-Z]{1,4}_\d{1,3}[A-Z]?$")
 # a number with a unit prefix (1M, 10K, 4k7, 100n): the value of a discrete part, never its pin number
 VALUE_UNIT_RE = re.compile(r"^\d+(?:\.\d+)?[pnuµmkKMG][FHΩ]?$|^\d+[RKMpnu]\d+[A-Za-z]*$")
 # component values / part attributes -- never net names
@@ -261,7 +265,7 @@ class PageNetlist:
     words: list[Word]
     source: str = "vector"  # "vector" | "vector+ocr" | "raster"
     refdes_color: tuple = ()  # colour the refdes words were recognised by (empty: none available)
-    scale: float = 1.0  # page text height / TEXT_UNIT (multiplies every geometric tolerance)
+    scale: float = 1.0  # drawing text height / TEXT_UNIT (multiplies every geometric tolerance)
     text_size: Optional[float] = None  # measured legible text height (pt); None: no text layer
 
 
@@ -281,7 +285,7 @@ class Primitives:
     source: str = "vector"
     # scans lose junction dots: then a wire ending mid-way on a wire this long is a T-junction
     dotless_t_min: Optional[float] = None
-    scale: float = 1.0  # page text height / TEXT_UNIT: scales every geometric tolerance
+    scale: float = 1.0  # drawing text height / TEXT_UNIT: scales every geometric tolerance
     text_size: Optional[float] = None
     strokes: list[tuple[float, float, float, float]] = field(default_factory=list)  # orthogonal lines of symbol graphics
     bars: list[tuple[float, float, float, float]] = field(default_factory=list)  # thick strokes drawn as slim rectangles
@@ -314,29 +318,23 @@ def page_text_size(page, frac: float = TEXT_MIN) -> Optional[float]:
     return legible[len(legible) // 2]
 
 
-def document_scale(pdf_path: str, pages: Optional[list[int]] = None) -> float:
-    """Fallback for pages without a text layer of their own: the document's legible text height
-    / TEXT_UNIT (pdfium font sizes, fast). 1.0 when the document has too little text."""
-    import pypdfium2 as pdfium
-    import pypdfium2.raw as pdfium_c
+def document_scale(pdf_path: str, pages: Optional[list[int]] = None, sample: int = 16) -> Optional[float]:
+    """The document's drawing scale: the lower median of the legible text height of (a sample of)
+    its pages, / TEXT_UNIT. None when the document has (almost) no text layer."""
+    import pdfplumber
 
-    hs: list[float] = []
-    doc = pdfium.PdfDocument(pdf_path)
-    try:
-        for pno in pages or range(1, len(doc) + 1):
-            tp = doc[pno - 1].get_textpage()
-            n = tp.count_chars()
-            for i in range(0, n, max(1, n // 200)):
-                v = pdfium_c.FPDFText_GetFontSize(tp.raw, i)
-                if 0 < v < 200:
-                    hs.append(v)
-    finally:
-        doc.close()
-    if len(hs) < 50:
-        return 1.0
-    floor = _legible_floor(hs)
-    legible = sorted(v for v in hs if v >= floor)
-    return legible[len(legible) // 2] / TEXT_UNIT
+    with pdfplumber.open(pdf_path) as pdf:
+        idxs = pages or list(range(1, len(pdf.pages) + 1))
+        sizes = []
+        for pno in idxs[:: max(1, -(-len(idxs) // sample))]:
+            page = pdf.pages[pno - 1]
+            ts = page_text_size(page)
+            page.flush_cache()
+            if ts is not None:
+                sizes.append(ts)
+    if not sizes:
+        return None
+    return sorted(sizes)[(len(sizes) - 1) // 2] / TEXT_UNIT
 
 
 def _gather(page, dot_max: float = DOT_MAX, dot_fill_max: float = DOT_FILL_MAX, thin_max: float = THIN_MAX) -> tuple[list, ...]:
@@ -379,6 +377,7 @@ def _gather(page, dot_max: float = DOT_MAX, dot_fill_max: float = DOT_FILL_MAX, 
         for a, b in zip(pts, pts[1:]):
             add_seg(a, b)
 
+    rings_small: list[tuple[float, float, float, float]] = []
     for o in page.curves:
         x0, y0, x1, y1 = o["x0"], o["top"], o["x1"], o["bottom"]
         w, h = x1 - x0, y1 - y0
@@ -388,6 +387,12 @@ def _gather(page, dot_max: float = DOT_MAX, dot_fill_max: float = DOT_FILL_MAX, 
         distinct = len({(round(q[0], 2), round(q[1], 2)) for q in pts})
         if w <= dot_max and h <= dot_max and distinct == 3:
             tris.append((x0, y0, x1, y1))  # pin-direction arrowhead on a box edge: a mark, not a junction
+            continue
+        # a small circle drawn as a thin outline (a contact or test point ring) is no junction dot --
+        # unless a filled dot lies on it (the dot's own outline, drawn separately)
+        hollow = not o.get("fill") and (o.get("linewidth") or 0) < 0.6 * max(w, h)
+        if w <= dot_max and h <= dot_max and has_curve and hollow:
+            rings_small.append((x0, y0, x1, y1))
             continue
         if w <= dot_max and h <= dot_max and (has_curve or o.get("fill")):
             dots.append(((x0 + x1) / 2, (y0 + y1) / 2, max(w, h) / 2))
@@ -418,6 +423,10 @@ def _gather(page, dot_max: float = DOT_MAX, dot_fill_max: float = DOT_FILL_MAX, 
         for a, b in ps:
             add_seg(a, b, body)
 
+    for b in rings_small:
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        if not any(math.hypot(cx - x, cy - y) <= max(eps, 0.25 * r) for x, y, r in dots):
+            curves.append(b)
     pw, ph = float(page.width), float(page.height)
     borders = []
     for o in page.rects:
@@ -430,6 +439,10 @@ def _gather(page, dot_max: float = DOT_MAX, dot_fill_max: float = DOT_FILL_MAX, 
             borders.append((x0, y0, x1, y1))
             continue  # page border
         if w <= dot_max and h <= dot_max:
+            if min(w, h) >= eps and max(w, h) >= 2.5 * min(w, h):
+                # a slim filled dash (of a dashed line drawn piece by piece), not a round junction dot
+                add_seg((x0, (y0 + y1) / 2), (x1, (y0 + y1) / 2)) if w > h else add_seg(((x0 + x1) / 2, y0), ((x0 + x1) / 2, y1))
+                continue
             dots.append(((x0 + x1) / 2, (y0 + y1) / 2, max(w, h) / 2))
             continue
         if w < eps or h < eps:
@@ -509,11 +522,11 @@ def page_words(page, min_size: float = 0.0, scale: float = 1.0) -> list[Word]:
     ]
 
 
-def vector_primitives(page, scale: float = 1.0) -> Primitives:
-    """``scale`` is only the fallback for a page without legible text of its own."""
+def vector_primitives(page, scale: Optional[float] = None) -> Primitives:
+    """``scale``: the document's (see document_scale); None reads it from this page's text."""
     ts = page_text_size(page)
-    if ts is not None:
-        scale = ts / TEXT_UNIT
+    if scale is None:
+        scale = ts / TEXT_UNIT if ts is not None else 1.0
     # hidden fields: under LEGIBLE_MIN of the median of all text that is not tiny
     ts_all = page_text_size(page, LEGIBLE_MIN)
     floor = LEGIBLE_MIN * ts_all if ts_all is not None else 0.0
@@ -524,7 +537,7 @@ def vector_primitives(page, scale: float = 1.0) -> Primitives:
     return Primitives(orth, diag, curves, boxes, dots, words, tol=TOL * scale, colinear_tol=0.05 * scale, scale=scale, tris=tris, text_size=ts, strokes=strokes, bars=bars, rings=rings)
 
 
-def extract_page(page, pno: int, refdes_color_hint: tuple = (), scale: float = 1.0) -> PageNetlist:
+def extract_page(page, pno: int, refdes_color_hint: tuple = (), scale: Optional[float] = None) -> PageNetlist:
     """Netlist of one page; pages without vector drawing go through the raster/OCR front-end."""
     from . import image_extract
 
@@ -550,7 +563,82 @@ def _dedupe(items: list, key=lambda v: tuple(round(x, 2) for x in v)) -> list:
     return out
 
 
-def _line_boxes(orth: list, tol: float, wmax: float, hmax: float, boxes: list) -> tuple[list, list]:
+def _dashes(orth: list, tol: float, dash_max: float) -> set[int]:
+    """Segments of a dashed line drawn stroke by stroke: three or more short colinear pieces of about
+    one length, one gap apart. Wires are never dashed (a mechanical link, a grouping frame)."""
+    rows: dict[tuple, list[int]] = defaultdict(list)
+    for i, (x0, y0, x1, y1) in enumerate(orth):
+        h = y1 - y0 <= x1 - x0
+        if max(x1 - x0, y1 - y0) <= dash_max:
+            rows[(h, round((y0 if h else x0) / tol))].append(i)
+    out: set[int] = set()
+    for (h, _), idx in rows.items():
+        lo, hi = (0, 2) if h else (1, 3)
+        idx.sort(key=lambda i: orth[i][lo])
+        run = idx[:1]
+
+        def flush() -> None:
+            if len(run) >= 3:
+                out.update(run)
+
+        for i in idx[1:]:
+            p = orth[run[-1]]
+            s = orth[i]
+            gap = s[lo] - p[hi]
+            ln = (p[hi] - p[lo], s[hi] - s[lo])
+            prev_gap = orth[run[-1]][lo] - orth[run[-2]][hi] if len(run) > 1 else gap
+            if tol < gap <= 2 * max(ln) and max(ln) <= 1.5 * min(ln) + tol and abs(gap - prev_gap) <= 0.3 * gap + tol:
+                run.append(i)
+            else:
+                flush()
+                run = [i]
+        flush()
+    return out
+
+
+def _combs(orth: list, dots: list, tol: float, bar_max: float) -> set[int]:
+    """Ground / chassis symbols drawn as plain lines: a short bar with two or more short parallel
+    prongs hanging off it to one side, their far ends free, and no junction dot -- a wire never
+    branches into free stubs like a comb."""
+    g = Grid(10.0)
+    for i, s in enumerate(orth):
+        g.add(i, s[0] - tol, s[1] - tol, s[2] + tol, s[3] + tol)
+
+    def ends_free(px: float, py: float, own: set) -> bool:
+        return not any(
+            j not in own and _pt_seg_dist(px, py, *orth[j]) <= tol for j in g.query(px - tol, py - tol, px + tol, py + tol)
+        )
+
+    dg = Grid(10.0)
+    for k, (x, y, _r) in enumerate(dots):
+        dg.add(k, x, y, x, y)
+    out: set[int] = set()
+    for b, (x0, y0, x1, y1) in enumerate(orth):
+        h = y1 - y0 <= x1 - x0
+        L = max(x1 - x0, y1 - y0)
+        if not tol < L <= bar_max or dg.query(x0 - tol, y0 - tol, x1 + tol, y1 + tol):
+            continue
+        sides: dict[int, list[int]] = defaultdict(list)
+        for j in g.query(x0 - tol, y0 - tol, x1 + tol, y1 + tol):
+            a0, b0, a1, b1 = orth[j]
+            if j == b or (b1 - b0 <= a1 - a0) == h:
+                continue
+            for (px, py), (qx, qy) in (((a0, b0), (a1, b1)), ((a1, b1), (a0, b0))):
+                if _pt_seg_dist(px, py, x0, y0, x1, y1) <= tol:
+                    sides[1 if (qy > py if h else qx > px) else -1].append(j)
+                    break
+        for side, prongs in sides.items():
+            lens = [max(orth[j][2] - orth[j][0], orth[j][3] - orth[j][1]) for j in prongs]
+            if len(prongs) < 2 or max(lens) > L or len(sides.get(-side, [])) > 1:
+                continue
+            own = set(prongs) | {b}
+            tips = [(orth[j][2], orth[j][3]) if (orth[j][3] > orth[j][1] if h else orth[j][2] > orth[j][0]) == (side > 0) else (orth[j][0], orth[j][1]) for j in prongs]
+            if all(ends_free(px, py, own) for px, py in tips):
+                out |= own
+    return out
+
+
+def _line_boxes(orth: list, tol: float, wmax: float, hmax: float, boxes: list, dots: list = ()) -> tuple[list, list]:
     """Rectangles drawn as four separate lines meeting only at their corners are boxes (up to
     wmax x hmax: a page-sized one is the drawing frame). One drawn inside a box is that symbol's
     own internal graphics and stays lines."""
@@ -583,7 +671,10 @@ def _line_boxes(orth: list, tol: float, wmax: float, hmax: float, boxes: list) -
                 if l is None or r is None or l in used or r in used:
                     continue
                 corners = [(a, q(y0)), (b, q(y0)), (a, q(y1)), (b, q(y1))]
+                # (a junction dot on the outline makes it a loop of wire)
                 if all(ends[c] == 2 for c in corners) and not any(
+                    _box_edge_dist(x, y, (x0, y0, x1, y1)) <= tol + r for x, y, r in dots
+                ) and not any(
                     (o[0] - tol <= x0 and x1 <= o[2] + tol and o[1] - tol <= y0 and y1 <= o[3] + tol)
                     or any(_box_edge_dist(x, y, o) <= tol for x in (x0, x1) for y in (y0, y1))
                     for o in boxes
@@ -596,8 +687,34 @@ def _line_boxes(orth: list, tol: float, wmax: float, hmax: float, boxes: list) -
 
 def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_hint: tuple = ()) -> PageNetlist:
     orth, diag, curves, boxes, dots = (_dedupe(v) for v in (prims.orth, prims.diag, prims.curves, prims.boxes, prims.dots))
-    orth, line_boxes = _line_boxes(orth, prims.tol, 0.5 * pw, 0.5 * ph, boxes)
+    dashed = _dashes(orth, prims.tol, 4.0 * prims.scale)
+    if dashed:
+        orth = [s for i, s in enumerate(orth) if i not in dashed]
+    comb = _combs(orth, dots, prims.tol, 3.0 * TEXT_UNIT * prims.scale)
+    if comb:
+        prims.strokes = list(prims.strokes) + [orth[i] for i in comb]
+        orth = [s for i, s in enumerate(orth) if i not in comb]
+    orth, line_boxes = _line_boxes(orth, prims.tol, 0.5 * pw, 0.5 * ph, boxes, dots)
     boxes += line_boxes
+    # a narrow empty rectangle with a junction dot on a corner is a loop of wire drawn in one stroke
+    # (a symbol body is joined at its pins, never at a corner)
+    loops = [
+        b for b in boxes
+        if min(b[2] - b[0], b[3] - b[1]) <= 1.5 * TEXT_UNIT * prims.scale
+        and any(math.hypot(x - cx, y - cy) <= prims.tol + r for x, y, r in dots for cx in (b[0], b[2]) for cy in (b[1], b[3]))
+        and not any(b[0] < w.cx < b[2] and b[1] < w.cy < b[3] for w in prims.words)
+    ]
+    if loops:
+        boxes = [b for b in boxes if b not in loops]
+        for x0, y0, x1, y1 in loops:
+            orth += [(x0, y0, x1, y0), (x0, y1, x1, y1), (x0, y0, x0, y1), (x1, y0, x1, y1)]
+    # an outline far bigger than a symbol with a junction dot inside is a region drawn around a
+    # sub-circuit (a symbol never holds a wire junction)
+    big = 40.0 * prims.scale
+    curves = [
+        b for b in curves
+        if not (b[2] - b[0] > big and b[3] - b[1] > big and any(b[0] < x < b[2] and b[1] < y < b[3] for x, y, _r in dots))
+    ]
     words = _dedupe(prims.words, lambda w: (w.text, round(w.x0, 1), round(w.top, 1), round(w.x1, 1), round(w.bottom, 1)))
     prims.strokes, prims.tris = _dedupe(prims.strokes), _dedupe(prims.tris)
     tol, col_tol, t_min = prims.tol, prims.colinear_tol, prims.dotless_t_min
@@ -634,7 +751,7 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
     # on into the box at the outline so the pin sits on the box edge. A grouping frame around a
     # sub-circuit keeps its content: it holds another box of symbol size, a junction dot or a
     # reference designator, and its wires never reach its outline -- symbol internals always do.
-    refdes_color = _dominant_color([w for w in words if SUFFIXED_REFDES_RE.match(w.text)]) or refdes_color_hint
+    refdes_color = refdes_color_hint or _dominant_color([w for w in words if SUFFIXED_REFDES_RE.match(w.text)])
     if boxes and orth:
         nested_min = NESTED_BOX_MIN * S
         og = Grid(10.0)
@@ -648,6 +765,7 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
         for k, (x, y, _r) in enumerate(dots):
             dgrid0.add(k, x, y, x, y)
         drop: set[int] = set()
+        frames: set[tuple] = set()
         clip: dict[int, tuple[float, float, float, float]] = {}
         for b in boxes:
             if b[2] - b[0] > 0.5 * pw and b[3] - b[1] > 0.5 * ph:
@@ -666,11 +784,11 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 continue
             if any(deep(dots[k][0], dots[k][1]) for k in dgrid0.query(*b)):
                 continue
-            if any(deep(words[k].cx, words[k].cy) for k in rgrid.query(*b)):
-                continue
+            if any(deep(words[k].cx, words[k].cy) and _box_edge_dist(words[k].cx, words[k].cy, b) > words[k].text_height for k in rgrid.query(*b)):
+                continue  # (a designator-like word hugging the outline is a pin name: G1, S2)
             inner: list[int] = []
             cuts: dict[int, tuple[float, float, float, float]] = {}
-            reaches = False
+            reaches = pinned = False
             for i in og.query(b[0] - tol, b[1] - tol, b[2] + tol, b[3] + tol):
                 x0, y0, x1, y1 = orth[i]
                 in0, in1 = inside(x0, y0), inside(x1, y1)
@@ -684,11 +802,29 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 elif deep(x1, y1) and not in0:  # comes in from the left / top
                     cuts[i] = (x0, y0, b[0], y1) if abs(y0 - y1) <= abs(x0 - x1) else (x0, y0, x1, b[1])
                     reaches = True
+                elif in0 or in1:
+                    pinned = True  # a line ending on the outline from outside: a pin
+            # an outline drawn over the wiring -- wires cross it, none ends on it -- around connector
+            # flags and their names is a highlight frame, not a symbol
+            if cuts and not pinned and any(
+                deep(words[k].cx, words[k].cy) and re.search(r"[A-Za-z]{2}", words[k].text) for k in tg.query(*b)
+            ):
+                frames.add(b)
+                continue
             if reaches:
                 drop.update(inner)
                 clip.update(cuts)
+            elif inner:
+                # lines wholly inside that end on graphics drawn inside (an amplifier's triangle) are body
+                inside_g = [g for g in list(prims.tris) + curves if inside(g[0], g[1]) and inside(g[2], g[3])]
+                drop.update(
+                    i for i in inner
+                    if any(_pt_bbox_dist(px, py, g) <= tol for g in inside_g for px, py in ((orth[i][0], orth[i][1]), (orth[i][2], orth[i][3])))
+                )
         if drop or clip:
             orth = [clip.get(i, s) for i, s in enumerate(orth) if i not in drop]
+        if frames:
+            boxes = [b for b in boxes if b not in frames]
 
     # a line drawn within closed triangles (the anode-cathode line through a diode) is their body
     strokes = list(prims.strokes)
@@ -750,17 +886,22 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
     def horiz(i: int) -> bool:
         return abs(orth[i][1] - orth[i][3]) <= abs(orth[i][0] - orth[i][2])
 
-    # endpoint coincidence + colinear overlap
+    # endpoint coincidence + colinear overlap. An end where every line met runs back the same way
+    # (a wire drawn over a pin line from its tip) is still a loose end of the drawing
     endpoint_links = [[0, 0] for _ in range(n)]  # per seg, per end: number of connections
     for i, (x0, y0, x1, y1) in enumerate(orth):
         for e, (px, py) in enumerate(((x0, y0), (x1, y1))):
+            ox, oy = (x1, y1) if e == 0 else (x0, y0)
+            L = math.hypot(px - ox, py - oy) or 1.0
+            ux, uy = (px - ox) / L, (py - oy) / L
             for j in sgrid.query(px - tol, py - tol, px + tol, py + tol):
                 if j == i:
                     continue
                 a0, b0, a1, b1 = orth[j]
                 if math.hypot(px - a0, py - b0) <= tol or math.hypot(px - a1, py - b1) <= tol:
                     uf.union(i, j)
-                    endpoint_links[i][e] += 1
+                    if horiz(i) != horiz(j) or max((a0 - px) * ux + (b0 - py) * uy, (a1 - px) * ux + (b1 - py) * uy) > tol:
+                        endpoint_links[i][e] += 1
                 elif horiz(i) == horiz(j) and _pt_seg_dist(px, py, a0, b0, a1, b1) <= col_tol:
                     uf.union(i, j)  # colinear overlap -> continuation
                     endpoint_links[i][e] += 1
@@ -838,6 +979,59 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
             if endpoint_links[i][e] == 0 and not at_dot(px, py):
                 dangling.append((i, e, px, py))
 
+    # a wire ending straight in front of a pin line's loose end, a short gap apart with the pin's
+    # number standing in the gap, meets that pin: the pin is drawn shorter than its electrical length
+    ngrid = Grid(10.0)
+    for k, w in enumerate(words):
+        if re.fullmatch(r"\d{1,3}", w.text):
+            ngrid.add(k, w.x0, w.top, w.x1, w.bottom)
+    gap_max = 1.5 * TEXT_UNIT * S
+    bare = [d for d in dangling if not any(touches(elems[k], d[2], d[3]) for k in egrid.query(d[2] - tol, d[3] - tol, d[2] + tol, d[3] + tol))]
+    bgrid = Grid(10.0)
+    for k, (i, e, px, py) in enumerate(bare):
+        bgrid.add(k, px, py, px, py)
+    joined: set[tuple[int, int]] = set()
+    bridge: dict[tuple[int, int], int] = {}  # loose end -> the line across the gap
+    for k, (i, e, px, py) in enumerate(bare):
+        x0, y0, x1, y1 = orth[i]
+        ux, uy = (px - (x1 if e == 0 else x0), py - (y1 if e == 0 else y0))
+        L = math.hypot(ux, uy) or 1.0
+        ux, uy = ux / L, uy / L
+        for m in bgrid.query(px - gap_max, py - gap_max, px + gap_max, py + gap_max):
+            j, f, qx, qy = bare[m]
+            if m <= k or horiz(i) != horiz(j) or uf.find(i) == uf.find(j):
+                continue
+            along, off = (qx - px) * ux + (qy - py) * uy, abs((qy - py) * ux - (qx - px) * uy)
+            if off > tol or not tol < along <= gap_max:
+                continue
+            lo, hi = (min(px, qx), max(px, qx)) if abs(ux) > 0.5 else (min(py, qy), max(py, qy))
+            a0, b0, a1, b1 = orth[j]
+            if ((a0 + a1 - 2 * qx) * ux + (b0 + b1 - 2 * qy) * uy) <= 0:
+                continue  # the other line runs back into the gap: not facing
+            gap_box = (lo + tol, py - tol, hi - tol, py + tol) if abs(ux) > 0.5 else (px - tol, lo + tol, px + tol, hi - tol)
+            if any(
+                s[0] <= gap_box[2] and s[2] >= gap_box[0] and s[1] <= gap_box[3] and s[3] >= gap_box[1]
+                for s in (orth[q] for q in sgrid.query(*gap_box))
+            ) or any(_bbox_gap(gap_box, elem_bbox(elems[q])) <= 0 for q in egrid.query(*gap_box)):
+                continue  # something else lies in the gap
+            # exactly one of the two is a pin line: short, its other end on a symbol
+            pinlike = [
+                math.hypot(s[2] - s[0], s[3] - s[1]) <= PIN_RUN_MAX * S
+                and any(touches(elems[q], ex, ey) for q in egrid.query(ex - tol, ey - tol, ex + tol, ey + tol))
+                for s, (ex, ey) in ((orth[i], (x1, y1) if e == 0 else (x0, y0)), (orth[j], (a1, b1) if f == 0 else (a0, b0)))
+            ]
+            if sum(pinlike) != 1:
+                continue
+            m3 = 3.5 * S
+            box = (lo - S, py - m3, hi + S, py + m3) if abs(ux) > 0.5 else (px - m3, lo - S, px + m3, hi + S)
+            if any(box[0] <= words[w].cx <= box[2] and box[1] <= words[w].cy <= box[3] for w in ngrid.query(*box)):
+                uf.union(i, j)
+                joined.update({(i, e), (j, f)})
+                bridge[(round(px / tol), round(py / tol))] = j
+                bridge[(round(qx / tol), round(qy / tol))] = i
+    if joined:
+        dangling = [d for d in dangling if (d[0], d[1]) not in joined]
+
     # orth segments whose interior is touched (no dot) by a dangling end of ANOTHER net: body edges
     body_orth: set[int] = set()
     for i, _e, px, py in dangling:
@@ -909,6 +1103,24 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
     def touched_elems(px: float, py: float) -> list[int]:
         return [k for k in egrid.query(px - tol, py - tol, px + tol, py + tol) if touches(elems[k], px, py)]
 
+    def numbered_end(i: int, e: int) -> Optional[int]:
+        """The pin number standing nearest beside the last PIN_RUN_MAX of line i before its end e."""
+        x0, y0, x1, y1 = orth[i]
+        px, py, ox, oy = (x0, y0, x1, y1) if e == 0 else (x1, y1, x0, y0)
+        run, m = PIN_RUN_MAX * S, 3.5 * S
+        h = horiz(i)
+        q = (px - run if ox < px else px + run) if h else (py - run if oy < py else py + run)
+        lo, hi = min(q, px if h else py), max(q, px if h else py)
+        best, bd = None, m
+        for k in (ngrid.query(lo, py - m, hi, py + m) if h else ngrid.query(px - m, lo, px + m, hi)):
+            w = words[k]
+            along, a0, a1 = (w.cx, w.top, w.bottom) if h else (w.cy, w.x0, w.x1)
+            c = py if h else px
+            gap = c - a1 if a1 <= c + tol else a0 - c
+            if lo - S <= along <= hi + S and -tol <= gap <= bd:
+                best, bd = k, max(gap, 0.0)
+        return best
+
     for root, segs in net_segs.items():
         if len(segs) > 10:
             continue
@@ -918,19 +1130,24 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
         ys1 = max(orth[s][3] for s in segs)
         if xs1 - xs0 > internal_max or ys1 - ys0 > internal_max:
             continue
+        if any(s in body_orth for s in segs):
+            body_orth.update(segs)  # a small stroke group that a pin ends on mid-way: a symbol's bar with its hooks
+            continue
         ends = dangling_by_net.get(root, [])
         if not ends:
             continue
         roots = set()
-        ok = True
+        loose = 0
         for _, _, px, py in ends:
             t = touched_elems(px, py)
-            if not t:
-                ok = False
-                break
+            loose += not t
             roots.update(cuf.find(k) for k in t)
         tiny = xs1 - xs0 <= tiny_net and ys1 - ys0 <= tiny_net
-        if ok and (len(roots) == 1 or tiny):
+        # (a tiny stroke off one symbol with a free end is its flourish: the hook of a Schottky bar)
+        if (not loose and (len(roots) == 1 or tiny)) or (tiny and len(roots) == 1):
+            # ... but a wire that ties numbered pins of one symbol together is a wire
+            if not tiny and len({numbered_end(i, e) for i, e, _, _ in ends} - {None}) >= 2:
+                continue
             body_orth.update(segs)
 
     # add body orth segments as elements and recluster
@@ -944,9 +1161,24 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
     cluster_elems(elems, egrid)
     body_orth_set = body_orth
 
+    def blade_over(px: float, py: float, ux: float, uy: float) -> list[int]:
+        """An open switch contact: a slanted blade hinged further in on this pin's axis lifts its
+        free end right over the pin end, however long the blade (the gap is the blade's rise)."""
+        for k in egrid.query(px - internal_max, py - internal_max, px + internal_max, py + internal_max):
+            if elems[k][0] != "D":
+                continue
+            g = elems[k][1]
+            for (ax, ay), (bx, by) in (((g[0], g[1]), (g[2], g[3])), ((g[2], g[3]), (g[0], g[1]))):
+                along_a, off_a = (ax - px) * ux + (ay - py) * uy, abs((ay - py) * ux - (ax - px) * uy)
+                along_b, off_b = (bx - px) * ux + (by - py) * uy, abs((by - py) * ux - (bx - px) * uy)
+                if off_a <= tol and along_a > tol and abs(along_b) <= tol and tol < off_b <= along_a + tol:
+                    return [k]
+        return []
+
     # terminals = dangling ends (of non-body nets) that touch a body element -- or that point at
     # one within PIN_GAP (symbols such as relay contacts leave a small gap after the pin line)
     terminals: list[Terminal] = []
+    term_at: set[tuple] = set()
     for i, e, px, py in dangling:
         if i in body_orth_set:
             continue
@@ -974,7 +1206,13 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 t = [k for k in touched_elems(qx, qy) if (elems[k][0] != "O" or elems[k][1] in plates) and outward(k, qx, qy)]
                 step += 0.25 * S
         if not t:
+            t = blade_over(px, py, ux, uy)
+        if not t:
             continue
+        key = (uf.find(i), round(px / tol), round(py / tol))
+        if key in term_at:
+            continue  # the same loose end drawn twice (a wire laid over the pin line)
+        term_at.add(key)
         terminals.append(Terminal(pno, px, py, i, uf.find(i), ux, uy, cluster=t[0]))
 
     # a symbol drawn as one stroke path (a power / ground symbol with its stem) may start right on
@@ -1149,7 +1387,11 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                     continue
                 break
             if nxt is None:
-                break
+                j = bridge.get((round(fx / tol), round(fy / tol)))
+                if j is None or j in seen:
+                    break
+                a0, b0, a1, b1 = orth[j]
+                nxt, far = j, ((a1, b1) if math.hypot(fx - a0, fy - b0) <= math.hypot(fx - a1, fy - b1) else (a0, b0))
             seen.add(nxt)
             fx, fy = far
         d = math.hypot(fx - t.x, fy - t.y)
@@ -1188,7 +1430,7 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 gap = min(abs(w.x0 - x0), abs(x0 - w.x1))
                 ok = (w.x1 <= x0 or x0 <= w.x0) and gap <= 0.4 * h and min(y1, w.bottom) - max(y0, w.top) >= 0.6 * (w.bottom - w.top)
             else:
-                ok = 0 <= y0 - w.bottom <= 0.4 * h and min(x1, w.x1) - max(x0, w.x0) >= 0.6 * (w.x1 - w.x0)
+                ok = -0.15 * h <= y0 - w.bottom <= 0.4 * h and min(x1, w.x1) - max(x0, w.x0) >= 0.6 * (w.x1 - w.x0)  # (an underscore may dip onto it)
             if ok:
                 return j
         return None
@@ -1204,9 +1446,6 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 return True
         return False
 
-    def in_phrase(w: Word) -> bool:
-        return _in_phrase(words, wgrid, w)
-
     annotation: list[set[str]] = []
 
     def wire_under(w: Word) -> Optional[int]:
@@ -1215,7 +1454,7 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
         repeated by every relay) is no net name either."""
         if not re.search(r"[A-Za-z]", w.text) or VALUE_RE.match(w.text) or w.text_height > max_label_h:
             return None
-        if near_symbol(w) or in_phrase(w):
+        if near_symbol(w) or _in_phrase(words, wgrid, w, ("pin",)):
             return None
         if not annotation:
             annotation.append({v.text for v in words if near_symbol(v) and on_wire(v) is None})
@@ -1229,7 +1468,9 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
         x0, y0, x1, y1 = pin_run(t)
         for k in wgrid.query(x0 - 5 * S, y0 - 5 * S, x1 + 5 * S, y1 + 5 * S):
             w = words[k]
-            if not PINNUM_RE.match(w.text) or (refdes_color and w.color == refdes_color and (len(w.text) > 2 or colour_split)):
+            # a box pin may carry a word-like designator (TAB_15F, EP_1) printed like the pin numbers
+            loose_pin = cl_isbox[t.cluster] and bool(pin_color) and w.color == pin_color and bool(PIN_WORD_RE.match(w.text))
+            if not (PINNUM_RE.match(w.text) or loose_pin) or (refdes_color and w.color == refdes_color and (len(w.text) > 2 or colour_split)):
                 continue
             if re.match(r"[A-Z]+\d{3}", w.text):
                 continue  # lettered pin numbers (grid arrays) run to two digits: U201A is a designator
@@ -1241,14 +1482,14 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 if not (x0 - S <= w.cx <= x1 + S):
                     continue
                 gap = y0 - w.bottom if w.cy < y0 else w.top - y0
-                if gap < -1.2 * S or gap > 3.5 * S:
+                if gap < -max(1.2 * S, 0.2 * w.text_height) or gap > 3.5 * S:
                     continue
                 score = abs(gap) + 0.1 * abs(w.cx - t.x)
             else:  # vertical pin line: number left/right of it
                 if not (y0 - S <= w.cy <= y1 + S):
                     continue
                 gap = x0 - w.x1 if w.cx < x0 else w.x0 - x0
-                if gap < -1.2 * S or gap > 3.5 * S:
+                if gap < -max(1.2 * S, 0.2 * w.text_height) or gap > 3.5 * S:
                     continue
                 score = abs(gap) + 0.1 * abs(w.cy - t.y)
             if not any(ch.isdigit() for ch in w.text):
@@ -1274,6 +1515,24 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
 
     # first pass so that pin numbers that look like a refdes (C1, R2) are not taken for one
     assign_pins(set())
+    # a symbol prints its pin numbers on one side of its pin lines (above / left): where most of a
+    # symbol's numbers sit, a number on the other side of a line is its neighbour's
+    def side(ti: int, k: int) -> tuple[bool, bool]:
+        t, w = terminals[ti], words[k]
+        horiz_t = abs(t.dy) < 0.5
+        return horiz_t, (w.cy < t.y) if horiz_t else (w.cx < t.x)
+
+    sides: dict[tuple, Counter] = defaultdict(Counter)
+    for ti, k in pin_word.items():
+        h, s_ = side(ti, k)
+        sides[(terminals[ti].cluster, h)][s_] += 1
+    usual = {key: c.most_common(1)[0][0] for key, c in sides.items() if sum(c.values()) >= 3 and c.most_common(1)[0][1] >= 0.75 * sum(c.values())}
+    if usual:
+        cand = [
+            (sc + (2.0 * S if (key := (terminals[ti].cluster, side(ti, k)[0])) in usual and side(ti, k)[1] != usual[key] else 0.0), ti, k)
+            for sc, ti, k in cand
+        ]
+        assign_pins(set())
 
     def clear(x0: float, y0: float, x1: float, y1: float, own: int) -> bool:
         """True if no wire or other symbol graphic crosses the corridor box."""
@@ -1321,9 +1580,10 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
     # sits above (the usual placement), so stacked units (J891A over J891B) stay apart
     cl_refdes: dict[int, list[str]] = defaultdict(list)
     pairs: list[tuple[float, int, int]] = []
-    # without a refdes colour, text repeated on the page is a part value (AGN2004H), not a refdes
-    # (a mention inside a line of notes -- "K1 L1 L2 0.98" -- is no repeat of the part's label)
-    repeats = Counter(w.text for w in words if not _in_phrase(words, wgrid, w)) if not refdes_color else Counter()
+    # text repeated on the page is a part value (AGN2004H), not a refdes (a mention inside a line of
+    # notes -- "K1 L1 L2 0.98" -- is no repeat of the part's label); in the refdes colour only the
+    # loosely shaped ones (a part number by every relay) -- a strict designator may label each unit
+    repeats = Counter(w.text for w in words if not _in_phrase(words, wgrid, w) and not (refdes_color and REFDES_RE.match(w.text)))
     # text inside a box symbol level with one of its pins, starting right at that pin, is the
     # pin's name (LED2, A0) even when it reads like a designator
     in_box_name: set[int] = set()
@@ -1343,24 +1603,48 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 in_box_name.add(k)
 
     # a one-pin symbol with a name written on its far side is a connector flag: a designator-looking
-    # word further away than that name (a neighbour's value) is not its refdes
+    # word further away than that name (a neighbour's value) is not its refdes. A row of such flags
+    # merged into one cluster (stacked, all facing one way, each with its own name) takes none
     flag_name_d: dict[int, float] = {}
-    for ti, t in enumerate(terminals):
-        r = t.cluster
-        if nterm0[r] != 1 or cl_isbox[r]:
+    cl_terms0: dict[int, list[Terminal]] = defaultdict(list)
+    for t in terminals:
+        cl_terms0[t.cluster].append(t)
+    for r, ts in cl_terms0.items():
+        if cl_isbox[r] or len({(round(t.dx), round(t.dy)) for t in ts}) != 1:
             continue
-        lbb = local_bb(r, t)
-        if lbb is not None:
-            hit = _far_word(words, wgrid, t, lbb, lambda a, b_, c, d_, r=r: clear(a, b_, c, d_, r), S, max_label_h)
-            if hit is not None and not _refdes_like(words[hit[0]], refdes_color):
-                flag_name_d[r] = hit[1]
+        ds = []
+        for t in ts:
+            lbb = local_bb(r, t)
+            hit = None if lbb is None else _far_word(words, wgrid, t, lbb, lambda a, b_, c, d_, r=r: clear(a, b_, c, d_, r), S, max_label_h)
+            if hit is None or _refdes_like(words[hit[0]], refdes_color):
+                break
+            ds.append(hit[1])
+        else:
+            flag_name_d[r] = ds[0] if len(ds) == 1 else -1.0
 
     prefix_n = Counter(re.match(r"[A-Z]*", w.text).group() for w in words if REFDES_RE.match(w.text))
+
+    def stacked_under_ref(w: Word) -> bool:
+        h = w.text_height
+        if w.vertical:  # rotated lines stack sideways, aligned at their start
+            return any(
+                v is not w and v.vertical and _refdes_like(v, refdes_color) and min(abs(v.bottom - w.bottom), abs(v.top - w.top)) <= 0.5 * h
+                and -0.2 * h <= w.x0 - v.x1 <= 0.6 * h  # (lines of text read upward follow left to right)
+                for v in (words[k] for k in wgrid.query(w.x0 - 2 * h, w.top, w.x1 + 2 * h, w.bottom))
+            )
+        return any(
+            v is not w and not v.vertical and REFDES_RE.match(v.text) and abs(v.x0 - w.x0) <= 0.5 * h and -0.2 * h <= w.top - v.bottom <= 0.6 * h
+            for v in (words[k] for k in wgrid.query(w.x0 - h, w.top - 2 * h, w.x1 + h, w.top))
+        )
+
     for k, w in enumerate(words):
-        if w.role or repeats[w.text] > 2 or not _refdes_like(w, refdes_color) or k in in_box_name:
+        placeholder = bool(PLACEHOLDER_RE.match(w.text))
+        if w.role or k in in_box_name or not (placeholder or (repeats[w.text] <= 2 and _refdes_like(w, refdes_color))):
             continue
-        if refdes_color and w.color and w.color != refdes_color:
+        if refdes_color and w.color and w.color != refdes_color and not placeholder:
             continue
+        if not REFDES_RE.match(w.text) and not placeholder and stacked_under_ref(w):
+            continue  # the second line under a designator is the part's value / part number
         # a part number (LM317, VCA810) reads like a designator too, but its prefix is rare on the
         # page and its number long: it only names a symbol no real designator claims
         m = re.match(r"([A-Z]*)(\d*)", w.text)
@@ -1383,6 +1667,12 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 if not (bb[0] - S <= w.cx <= bb[2] + S) and w.bottom > bb[1] and w.top < bb[3]:
                     d += 2.0 * S  # beside the symbol, not centred over / under it: a neighbour's label passing by
                 pairs.append((d + odd, k, r))
+    # a word right by one symbol is that symbol's, never a far unnumbered block's
+    near_d: dict[int, float] = {}
+    for d, k, r in pairs:
+        near_d[k] = min(near_d.get(k, 1e9), d)
+    n_numbered = Counter(terminals[ti].cluster for ti in pin_word)
+    pairs = [p for p in pairs if not cl_isbox[p[2]] or nterm0[p[2]] < 3 or 2 * n_numbered[p[2]] >= nterm0[p[2]] or p[0] <= 2.5 * near_d[p[1]] + 3.0 * S]
     pairs.sort()
     # every symbol carries its own designator: words and symbols are matched one to one at the
     # least total distance (C4 printed against C3's plate still goes to the capacitor below it);
@@ -1393,7 +1683,8 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
         nearest.setdefault(k, (d, r))
     units: dict[tuple, list[int]] = defaultdict(list)
     for k, (_d, r) in nearest.items():
-        units[(re.sub(r"[A-Z]$", "", words[k].text), r)].append(k)
+        if not PLACEHOLDER_RE.match(words[k].text):
+            units[(re.sub(r"[A-Z]$", "", words[k].text), r)].append(k)
     fixed = {k: nearest[k] for ks in units.values() if len(ks) > 1 for k in ks}
     taken = {r for _d, r in fixed.values()}
     best_of = _match([p for p in pairs if p[1] not in fixed and p[2] not in taken], REFDES_REACH * S)
@@ -1401,8 +1692,15 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
     for d, k, r in pairs:
         if k not in best_of and d < 15.0 * S and wire_under(words[k]) is None:  # (one written along a wire is a net name)
             best_of[k] = (d, r)
+    ref_name: dict[int, str] = {}
+    n_placeholder: Counter = Counter()
     for k, (_d, r) in sorted(best_of.items(), key=lambda kv: kv[1][0]):
-        cl_refdes[r].append(words[k].text)
+        text = words[k].text
+        if PLACEHOLDER_RE.match(text):
+            n_placeholder[text] += 1
+            text = f"{text}{pno}.{n_placeholder[text]}"  # R? -> R?4.2: unique, still reads as unannotated
+        ref_name[k] = text
+        cl_refdes[r].append(text)
         words[k].role = "refdes"
     # a part number printed by the symbol (AD8051, BC337) reads like a designator too; of two such
     # words on one symbol the designator is the one whose prefix the page uses more often, with
@@ -1411,7 +1709,10 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
     text_n = Counter(w.text for w in words)
 
     def ref_rank(t: str) -> tuple:
-        # (prefix rarity, repeated on the page -- a value repeats, a designator does not -- digits)
+        # (prefix rarity, repeated on the page -- a value repeats, a designator does not -- digits);
+        # an unannotated designator (D?) is a designator by its very form
+        if re.match(r"[A-Z]{1,3}\?", t):
+            return (-10**6, False, 0)
         m = re.match(r"([A-Z]*)(\d*)", t)
         return (-prefix_n[m.group(1)], text_n[t] > 1, len(m.group(2)))
 
@@ -1422,7 +1723,7 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
             if drop:
                 cl_refdes[r] = [t for t in refs if t not in drop]
                 for k in best_of:
-                    if words[k].text in drop and best_of[k][1] == r:
+                    if ref_name[k] in drop and best_of[k][1] == r:
                         words[k].role = ""
     # a small symbol is never anonymous while a designator-like word sits by one of its pins: when
     # that is the only number on its pins ("C1" beside one capacitor lead, the other lead bare) it
@@ -1445,11 +1746,25 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
             cl_refdes[r].append(words[ks[0]].text)
             words[ks[0]].role = "refdes"
 
-    # hierarchical block / sheet symbols: a box with several pins and no reference designator is
-    # a part too when it carries a title at its top-left corner or when its pins are numbered
+    # box symbols with several pins and no reference designator (hierarchical blocks, devices drawn
+    # as a plain box) are parts too when they carry a title at the top-left corner (their name) or
+    # numbered pins (then named BOX<page>.<n>)
     by_cluster: dict[int, list[int]] = defaultdict(list)
     for ti, t in enumerate(terminals):
         by_cluster[t.cluster].append(ti)
+
+    def titled_inside(b: list) -> bool:
+        """A device name written inside the box, well clear of its outline (pin names hug the
+        outline next to their pins)."""
+        for k in wgrid.query(*b):
+            w = words[k]
+            h = w.text_height
+            if w.role or not (b[0] < w.cx < b[2] and b[1] < w.cy < b[3]) or not re.search(r"[A-Za-z]{2}", w.text):
+                continue
+            if min(w.x0 - b[0], b[2] - w.x1, w.top - b[1], b[3] - w.bottom) >= 1.5 * h:
+                return True
+        return False
+
     nblock = 0
     for r, tis in by_cluster.items():
         if r in cl_refdes or not cl_isbox[r] or len(tis) < 3:
@@ -1475,16 +1790,16 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                 if b[0] <= w.cx <= b[2] and b[1] <= w.cy <= b[3]:
                     continue  # inside: a pin name
                 d = _bbox_gap(w.bbox, tuple(b))
-                if d < 15 * S and d < bd:
-                    best, bd = k, d
-        if best is None and not numbered:
+                if d < 15 * S and d < bd and not any(r2 != r and word_cluster_dist(w.bbox, r2) < d for r2 in term_clusters):
+                    best, bd = k, d  # (a name nearer another symbol is that one's)
+        if best is None and not numbered and not titled_inside(b):
             continue
         nblock += 1
         if best is not None:
             cl_refdes[r].append(words[best].text)
             words[best].role = "refdes"
         else:
-            cl_refdes[r].append(f"BLOCK{pno}_{nblock}")
+            cl_refdes[r].append(f"BOX{pno}.{nblock}")
 
     # anonymous clusters: off-page/power connectors if a label sits on their far side,
     # otherwise part of the nearest refdes'd cluster (e.g. a relay's separate contact circle)
@@ -1516,6 +1831,32 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
     terms_by_cl = defaultdict(list)
     for ti, t in enumerate(terminals):
         terms_by_cl[t.cluster].append(ti)
+    # a one-pin connector symbol carries a net name on its far side, never a designator -- even when
+    # the name reads like one (a bus line named CLK1_2): such a word goes back to the label pass
+    ref_k: dict[str, list[int]] = defaultdict(list)
+    for k, w in enumerate(words):
+        if w.role == "refdes":
+            ref_k[ref_name.get(k, w.text)].append(k)
+    for r in list(cl_refdes):
+        tis = terms_by_cl.get(r, [])
+        ks = {k for name in cl_refdes[r] for k in ref_k.get(name, [])}
+        if cl_isbox[r] or len(tis) != 1 or not ks:
+            continue
+        t = terminals[tis[0]]
+        lbb = local_bb(r, t)
+        if lbb is None:
+            continue
+        for k in ks:
+            words[k].role = ""
+        hit = _far_word(words, wgrid, t, lbb, lambda a, b_, c, d_, r=r: clear(a, b_, c, d_, r), S, max_label_h)
+        for k in ks:
+            if hit is None or k != hit[0]:
+                words[k].role = "refdes"
+        if hit is not None and hit[0] in ks:
+            name = ref_name.get(hit[0], words[hit[0]].text)
+            cl_refdes[r] = [x for x in cl_refdes[r] if x != name]
+            if not cl_refdes[r]:
+                del cl_refdes[r]
     # a label goes to the flag it sits closest to: a flag whose own text is missing may otherwise
     # reach across (up to FAR_LABEL_MAX) and take the label of a neighbouring connector
     own = FAR_LABEL_OWN * S
@@ -1576,12 +1917,64 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
             for ti in tis:
                 terminals[ti].cluster = best
 
+    # units of one part (K3_1A, K3_1B) drawn touching each other are one symbol
+    unit_base = lambda t: re.sub(r"[A-Z]$", "", t)  # noqa: E731
+    by_base: dict[str, list[int]] = defaultdict(list)
+    for r, refs in cl_refdes.items():
+        if not cl_isbox[r]:
+            for b_ in {unit_base(t) for t in refs}:
+                by_base[b_].append(r)
+    for r in list(cl_refdes):
+        if r not in cl_refdes or cl_isbox[r]:
+            continue
+        for r2 in {q for t in cl_refdes[r] for q in by_base.get(unit_base(t), ())}:
+            if r2 == r or r2 not in cl_refdes:
+                continue
+            if not set(cl_refdes[r]) & set(cl_refdes[r2]) and _bbox_gap(tuple(cl_bbox[r]), tuple(cl_bbox[r2])) <= join_gap:
+                cl_refdes[r] += cl_refdes.pop(r2)
+                cl_elems[r].extend(cl_elems.pop(r2, []))
+                b, b2 = cl_bbox[r], cl_bbox[r2]
+                cl_bbox[r] = [min(b[0], b2[0]), min(b[1], b2[1]), max(b[2], b2[2]), max(b[3], b2[3])]
+                for t in terminals:
+                    if t.cluster == r2:
+                        t.cluster = r
+
     # components
+    # a cluster holding the designators of separate parts (test points drawn touching), one per pin
+    # and all pins entering from one side, is that many one-pin parts: each pin goes to its nearest designator
+    word_of = {name: k for k, name in ref_name.items()}
+    split_terms: dict[int, list[tuple[str, list[int]]]] = {}
+    for r, refs in cl_refdes.items():
+        tis = [ti for ti, t in enumerate(terminals) if t.cluster == r]
+        bases = {unit_base(t) for t in refs}
+        if cl_isbox[r] or len(refs) < 2 or len(bases) != len(refs) or len(tis) != len(refs) or not all(t in word_of for t in refs):
+            continue
+        if len({(round(terminals[ti].dx), round(terminals[ti].dy)) for ti in tis}) != 1:
+            continue  # (pins facing each other are one two-pin part)
+        pairs_ = sorted(
+            (_pt_bbox_dist(terminals[ti].x, terminals[ti].y, words[word_of[t]].bbox), ti, t) for ti in tis for t in refs
+        )
+        got: dict[str, list[int]] = {}
+        used_t: set[int] = set()
+        for _d, ti, t in pairs_:
+            if ti not in used_t and t not in got:
+                got[t] = [ti]
+                used_t.add(ti)
+        split_terms[r] = sorted(got.items())
     comps: list[Component] = []
     cl_comp: dict[int, int] = {}
     for r, refs in cl_refdes.items():
-        cl_comp[r] = len(comps)
         shape = dict(Counter("O" if kind in ("L", "P") else kind for kind, _ in cl_elems.get(r, [])))
+        if r in split_terms:
+            for name, tis in split_terms[r]:
+                t0 = terminals[tis[0]]
+                for ti in tis:
+                    terminals[ti].comp = len(comps)
+                w = words[word_of[name]]
+                bb = (min(t0.x, w.x0), min(t0.y, w.top), max(t0.x, w.x1), max(t0.y, w.bottom))
+                comps.append(Component(pno, [name], bb, False, terminals=list(tis), shape=shape))
+            continue
+        cl_comp[r] = len(comps)
         comps.append(Component(pno, sorted(set(refs)), tuple(cl_bbox[r]), cl_isbox[r], shape=shape))
     for ti, t in enumerate(terminals):
         ci = cl_comp.get(t.cluster)
@@ -1734,19 +2127,22 @@ def _dominant_color(words: list[Word]) -> tuple:
     return c if k >= 3 else ()
 
 
-def _in_phrase(words: list[Word], wgrid: Grid, w: Word) -> bool:
-    """Another word on the same line a space away: part of a note or value, never one net name."""
+def _in_phrase(words: list[Word], wgrid: Grid, w: Word, skip: tuple = ()) -> bool:
+    """Another word on the same line a space away: part of a note or value, never one net name.
+    Words with a role in ``skip`` (a pin number before the name) do not count."""
     h = w.text_height
     if w.vertical:
-        return any(v is not w and v.vertical and abs(v.cx - w.cx) < 0.3 * h and v.bottom > w.top - h and v.top < w.bottom + h
+        return any(v is not w and v.role not in skip and v.vertical and abs(v.cx - w.cx) < 0.3 * h and v.bottom > w.top - h and v.top < w.bottom + h
                    for v in (words[k] for k in wgrid.query(w.x0, w.top - h, w.x1, w.bottom + h)))
-    return any(v is not w and not v.vertical and abs(v.cy - w.cy) < 0.3 * h and v.x1 > w.x0 - h and v.x0 < w.x1 + h
+    return any(v is not w and v.role not in skip and not v.vertical and abs(v.cy - w.cy) < 0.3 * h and v.x1 > w.x0 - h and v.x0 < w.x1 + h
                for v in (words[k] for k in wgrid.query(w.x0 - h, w.top, w.x1 + h, w.bottom)))
 
 
 def _labelish(text: str) -> bool:
-    # a two-letter word (HT, OE) can be a name; single letters are zone marks and pin names
-    return bool(re.search(r"[A-Za-z0-9]", text)) and not VALUE_RE.match(text) and (not PINNUM_RE.match(text) or bool(re.fullmatch(r"[A-Z]{2}", text)))
+    # a two-letter word (HT, OE) can be a name; single letters are zone marks and pin names; letters
+    # on both sides of the number (P5V, UP5V) make a name, not a grid pin number
+    return bool(re.search(r"[A-Za-z0-9]", text)) and not VALUE_RE.match(text) and (
+        not PINNUM_RE.match(text) or bool(re.fullmatch(r"[A-Z]{2}|[A-Z]{1,2}\d{1,3}[A-Z]", text)))
 
 
 def _far_word(
@@ -1827,7 +2223,8 @@ class Design:
     net_labels: dict[tuple, set[str]]
     label_nets: dict[str, tuple]
     net_terms: dict[tuple, list[tuple[int, int]]]  # gnet -> [(page_idx, terminal_idx)]
-    scale: float = 1.0  # drawing scale relative to the reference export (document_scale)
+    scale: float = 1.0  # document text height / TEXT_UNIT (document_scale)
+    raw_scale: Optional[float] = None  # measured document scale (None: too little text to measure)
 
     def gnet(self, page_idx: int, local_net: int) -> tuple:
         return self.net_uf.find((page_idx, local_net))
@@ -1955,7 +2352,7 @@ class ExtractionCancelled(Exception):
     """Raised by extract_design when its cancel_check returns True."""
 
 
-def _extract_pages(pdf_path: str, pnos: list[int], hint: tuple, scale: float) -> list[PageNetlist]:
+def _extract_pages(pdf_path: str, pnos: list[int], hint: tuple, scale: Optional[float]) -> list[PageNetlist]:
     """Worker: netlists of some pages of one PDF (each process opens the file itself)."""
     import pdfplumber
 
@@ -1975,6 +2372,17 @@ def _refdes_color_votes(pages: Iterable[PageNetlist]) -> dict[tuple, int]:
             if w.role == "refdes" and SUFFIXED_REFDES_RE.match(w.text):
                 votes[w.color] += 1
     return votes
+
+
+def _recolour(done: dict[int, PageNetlist]) -> tuple[tuple, list[int]]:
+    """The document-wide refdes colour and the pages to read again with it: those without a refdes
+    colour of their own and those whose own disagrees (a page where only net names carry suffixed
+    numbers such as BUS_3)."""
+    votes = _refdes_color_votes(done.values())
+    if not votes:
+        return (), []
+    hint = max(votes.items(), key=lambda kv: kv[1])[0]
+    return hint, [p for p, pn in done.items() if pn.source != "raster" and pn.refdes_color != hint]
 
 
 def _cache_dir() -> Optional[Path]:
@@ -2072,19 +2480,20 @@ def extract_design(
 
     done: dict[int, PageNetlist] = {}
     if workers <= 1:
-        color_votes: dict[tuple, int] = defaultdict(int)
         with pdfplumber.open(pdf_path) as pdf:
             for n, pno in enumerate(idxs, start=1):
                 if cancel_check is not None and cancel_check():
                     raise ExtractionCancelled()
-                hint = max(color_votes.items(), key=lambda kv: kv[1])[0] if color_votes else ()
                 page = pdf.pages[pno - 1]
-                done[pno] = extract_page(page, pno, hint, scale)
-                for c, v in _refdes_color_votes([done[pno]]).items():
-                    color_votes[c] += v
+                done[pno] = extract_page(page, pno, (), scale)
                 page.flush_cache()
                 if progress:
                     progress(n, total)
+            hint, redo = _recolour(done)
+            for pno in redo:
+                page = pdf.pages[pno - 1]
+                done[pno] = extract_page(page, pno, hint, scale)
+                page.flush_cache()
     else:
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -2100,19 +2509,16 @@ def extract_design(
                     done[pn.page] = pn
                 if progress:
                     progress(len(done), total)
-            # pages without a suffixed refdes of their own get the document-wide refdes colour
-            votes = _refdes_color_votes(done.values())
-            if votes:
-                hint = max(votes.items(), key=lambda kv: kv[1])[0]
-                redo = [p for p, pn in done.items() if pn.source != "raster" and not pn.refdes_color]
-                if redo:
-                    chunks = [redo[i::workers] for i in range(workers)]
-                    for fut in as_completed([pool.submit(_extract_pages, pdf_path, c, hint, scale) for c in chunks if c]):
-                        for pn in fut.result():
-                            done[pn.page] = pn
+            hint, redo = _recolour(done)
+            if redo:
+                chunks = [redo[i::workers] for i in range(workers)]
+                for fut in as_completed([pool.submit(_extract_pages, pdf_path, c, hint, scale) for c in chunks if c]):
+                    for pn in fut.result():
+                        done[pn.page] = pn
 
     design = build_design([done[p] for p in idxs])
-    design.scale = scale
+    design.scale = scale or 1.0
+    design.raw_scale = scale
     if cache_file is not None:
         try:
             with open(cache_file, "wb") as f:

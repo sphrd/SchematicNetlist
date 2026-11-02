@@ -374,7 +374,7 @@ def build_circuit(d: Design, source: str = "") -> Circuit:
         warnings.append(Warning_("info", n.pages[0], f"{r} pin {p or '?'} is connected to nothing ({n.name})"))
     for n in nets.values():
         if len(n.aliases) > 1:
-            warnings.append(Warning_("info", n.pages[0], f"net {n.name} also carries the label(s) {n.aliases[1:]}"))
+            warnings.append(Warning_("info", n.pages[0] if n.pages else None, f"net {n.name} also carries the label(s) {n.aliases[1:]}"))
     for part in parts.values():
         missing = sum(1 for p in part.pins if not p.number)
         if part.is_box and missing:

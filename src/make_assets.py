@@ -47,19 +47,11 @@ def draw_icon(size: int = 256) -> Image.Image:
     return img.resize((size, size), Image.LANCZOS)
 
 
-def draw_splash(width: int = 520, height: int = 300) -> Image.Image:
-    img = Image.new("RGB", (width, height), BG)
-    d = ImageDraw.Draw(img)
-    d.rectangle((0, 0, width - 1, height - 1), outline=SURFACE, width=2)
-    icon = draw_icon(96)
-    img.paste(icon, (36, 48), icon)
-    d.text((156, 54), "SchematicNetlist", font=_font(30, bold=True), fill=FG)
-    d.text((158, 100), "Schematic PDF  \u2192  netlist, HSPICE, Excel", font=_font(14), fill=MUTED)
-    d.line((36, 186, width - 36, 186), fill=SURFACE, width=2)
-    d.text((36, 200), "Starting up \u2014 unpacking the bundled Python runtime,", font=_font(12), fill=MUTED)
-    d.text((36, 220), "PDF engine and OCR. This takes a few seconds.", font=_font(12), fill=MUTED)
-    # the bootloader writes its progress text at SPLASH_TEXT_POS (see build_exe.py)
-    return img
+def draw_splash() -> Image.Image:
+    """Static part of the start-up splash (layout and live loading log: appshell.draw_splash / splash_tcl)."""
+    from schematic_netlist import __version__, appshell
+
+    return appshell.draw_splash("SchematicNetlist", "sphrd", __version__, "Free, open-source schematic PDF to netlist, SPICE and Excel", draw_icon(256))
 
 
 SPLASH_TEXT_POS = (36, 262)

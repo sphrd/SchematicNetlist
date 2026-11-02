@@ -24,6 +24,7 @@ from tkinter import font as tkfont
 import pdfplumber
 from PIL import Image, ImageDraw, ImageTk
 
+from . import __version__, appshell
 from .analyze import OUTPUTS, analyze_pdf
 from .netlist import ExtractionCancelled
 
@@ -39,6 +40,12 @@ _BaseTk = TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk
 APP_NAME = "SchematicNetlist"
 APP_ID = "SchematicNetlist.App"
 ICON = Path(__file__).resolve().parent / "assets" / "icon.ico"  # drawn by src/make_assets.py
+APP_INFO = appshell.AppInfo(
+    name=APP_NAME, version=__version__, author="sphrd",
+    description="Turns a schematic PDF into components, nets, an HSPICE deck and an Excel report.",
+    licence="Free and open source (MIT licence).", repo="sphrd/SchematicNetlist", asset="SchematicNetlist.exe",
+    icon_png=ICON.with_suffix(".png"),
+)
 RUN_TEXT = "Analyze schematic"
 OUTPUT_LABELS = {
     "excel": "Excel analysis report (<name>_analysis.xlsx)",
@@ -250,18 +257,11 @@ class _SpinnerOverlay(tk.Frame):
 
     def __init__(self, parent: tk.Misc, on_cancel) -> None:
         super().__init__(parent, bg=BG)
-        self._angle = 0
-        self._spinning = False
-        self._after_id: Optional[str] = None
-
         center = tk.Frame(self, bg=BG)
         center.place(relx=0.5, rely=0.5, anchor="center")
 
-        self.canvas = tk.Canvas(center, width=64, height=64, bg=BG, highlightthickness=0)
-        self.canvas.pack(pady=(0, 14))
-        self._arc = self.canvas.create_arc(
-            4, 4, 60, 60, start=0, extent=120, style="arc", width=6, outline=ACCENT
-        )
+        self.spinner = appshell.CometSpinner(center, 64, BG)
+        self.spinner.pack(pady=(0, 14))
 
         self.status_var = tk.StringVar(value="Analyzing...")
         tk.Label(
@@ -272,27 +272,17 @@ class _SpinnerOverlay(tk.Frame):
         _RoundButton(center, "Cancel", on_cancel, width=10).pack(pady=(16, 0))
 
     def show(self) -> None:
-        self.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # below the title bar, so the window can still be moved, minimised and closed while busy
+        self.place(x=0, y=appshell.TITLE_H, relwidth=1, relheight=1, height=-appshell.TITLE_H)
         self.lift()
-        self._spinning = True
-        self._spin()
+        self.spinner.start()
 
     def hide(self) -> None:
-        self._spinning = False
-        if self._after_id is not None:
-            self.after_cancel(self._after_id)
-            self._after_id = None
+        self.spinner.stop()
         self.place_forget()
 
     def set_status(self, text: str) -> None:
         self.status_var.set(text)
-
-    def _spin(self) -> None:
-        if not self._spinning:
-            return
-        self._angle = (self._angle + 18) % 360
-        self.canvas.itemconfig(self._arc, start=self._angle)
-        self._after_id = self.after(40, self._spin)
 
 
 class App(_BaseTk):
@@ -308,6 +298,8 @@ class App(_BaseTk):
         self._out_dir: Optional[Path] = None
         self._cancel_event: Optional[threading.Event] = None
         self._queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        appshell.install(self, APP_INFO, sys.modules[__name__], can_restart=lambda: not self._overlay.winfo_ismapped(),
+                         busy_text="Wait until the current analysis has finished, then restart.")
         self._build_ui()
         self._overlay = _SpinnerOverlay(self, on_cancel=self._on_cancel)
         self.after(100, self._drain_queue)
@@ -610,20 +602,13 @@ class App(_BaseTk):
         self.log_box.config(state="disabled")
 
 
-def _close_splash() -> None:
-    """The exe shows a splash image while unpacking (see build_exe.py); drop it once the window is up."""
-    try:
-        import pyi_splash  # only exists inside the PyInstaller build
-    except ImportError:
-        return
-    with contextlib.suppress(Exception):
-        pyi_splash.close()
-
-
 def main() -> None:
+    appshell.cleanup_leftovers()
+    appshell.splash_step("Building the main window")
     app = App()
+    appshell.splash_step("Opening the window")
     app.update_idletasks()
-    app.after(0, _close_splash)
+    app.after(0, lambda: appshell.close_splash(app))  # the splash stays until the window is on screen
     app.mainloop()
 
 
