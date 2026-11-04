@@ -110,13 +110,13 @@ winget install UB-Mannheim.TesseractOCR   # OCR engine (found in its default fol
 ```
 
 ```powershell
-schematic-netlist analyze MySchematic.pdf [-o outdir] [--name MyBoard] [--pages 1-20] [--no-excel] [--no-spice] [--no-netlist] [--workers 4] [--no-cache]
+schematic-netlist analyze MySchematic.pdf [-o outdir] [--name MyBoard] [--pages 1-20] [--no-excel] [--no-spice] [--no-netlist] [--workers 4]
 schematic-netlist-gui
 ```
 
-Pages are read in parallel processes and the extracted netlist is cached in
-`%LOCALAPPDATA%\SchematicNetlist\cache` (keyed by PDF content + engine code), so a re-run of
-the same PDF takes seconds.
+Pages are read in parallel processes (one per physical core, max 8, fewer when free memory is
+short). Every run reads the PDF afresh; nothing is cached (the cache folder of earlier versions,
+`%LOCALAPPDATA%\SchematicNetlist\cache`, is deleted on the first run).
 
 Build the exe (bundles Tesseract, ~110 MB): `.\build.ps1` (first time `.\build.ps1 -Setup` creates `.venv`) -> `.\SchematicNetlist.exe`.
 Headless use of the exe: `SchematicNetlist.exe --cli analyze board.pdf`; `--cli update [--restart]`

@@ -29,10 +29,9 @@ def analyze_pdf(
     progress: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     workers: Optional[int] = None,
-    use_cache: bool = True,
 ) -> Result:
     pdf_path, out_dir, outputs = Path(pdf_path), Path(out_dir), set(outputs)
-    design = extract_design(str(pdf_path), pages, progress=progress, cancel_check=cancel_check, workers=workers, use_cache=use_cache)
+    design = extract_design(str(pdf_path), pages, progress=progress, cancel_check=cancel_check, workers=workers)
     circuit = build_circuit(design, pdf_path.name)
     out_dir.mkdir(parents=True, exist_ok=True)
     res = Result(circuit)

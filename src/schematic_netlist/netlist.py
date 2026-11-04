@@ -21,12 +21,11 @@ the same way (orthogonal wires, dotted T-junctions, text-labelled connectors).
 """
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 import pickle
 import re
-import sys
+import shutil
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -318,23 +317,38 @@ def page_text_size(page, frac: float = TEXT_MIN) -> Optional[float]:
     return legible[len(legible) // 2]
 
 
+def _scale_sample(idxs: list[int], sample: int = 16) -> list[int]:
+    """The pages document_scale measures: an even sample of at most ``sample`` pages."""
+    return idxs[:: max(1, -(-len(idxs) // sample))]
+
+
+def _page_text_sizes(pdf_path: str, pnos: list[int]) -> list[Optional[float]]:
+    """Worker: page_text_size of some pages of one PDF."""
+    import pdfplumber
+
+    out = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for pno in pnos:
+            page = pdf.pages[pno - 1]
+            out.append(page_text_size(page))
+            page.flush_cache()
+    return out
+
+
+def _scale_of(sizes: Iterable[Optional[float]]) -> Optional[float]:
+    s = sorted(v for v in sizes if v is not None)
+    return s[(len(s) - 1) // 2] / TEXT_UNIT if s else None
+
+
 def document_scale(pdf_path: str, pages: Optional[list[int]] = None, sample: int = 16) -> Optional[float]:
     """The document's drawing scale: the lower median of the legible text height of (a sample of)
     its pages, / TEXT_UNIT. None when the document has (almost) no text layer."""
     import pdfplumber
 
-    with pdfplumber.open(pdf_path) as pdf:
-        idxs = pages or list(range(1, len(pdf.pages) + 1))
-        sizes = []
-        for pno in idxs[:: max(1, -(-len(idxs) // sample))]:
-            page = pdf.pages[pno - 1]
-            ts = page_text_size(page)
-            page.flush_cache()
-            if ts is not None:
-                sizes.append(ts)
-    if not sizes:
-        return None
-    return sorted(sizes)[(len(sizes) - 1) // 2] / TEXT_UNIT
+    if not pages:
+        with pdfplumber.open(pdf_path) as pdf:
+            pages = list(range(1, len(pdf.pages) + 1))
+    return _scale_of(_page_text_sizes(pdf_path, _scale_sample(list(pages), sample)))
 
 
 def _gather(page, dot_max: float = DOT_MAX, dot_fill_max: float = DOT_FILL_MAX, thin_max: float = THIN_MAX) -> tuple[list, ...]:
@@ -537,18 +551,22 @@ def vector_primitives(page, scale: Optional[float] = None) -> Primitives:
     return Primitives(orth, diag, curves, boxes, dots, words, tol=TOL * scale, colinear_tol=0.05 * scale, scale=scale, tris=tris, text_size=ts, strokes=strokes, bars=bars, rings=rings)
 
 
-def extract_page(page, pno: int, refdes_color_hint: tuple = (), scale: Optional[float] = None) -> PageNetlist:
-    """Netlist of one page; pages without vector drawing go through the raster/OCR front-end."""
+def page_primitives(page, scale: Optional[float] = None) -> Primitives:
+    """Drawing primitives of one page; pages without vector drawing go through the raster/OCR front-end."""
     from . import image_extract
 
     if image_extract.page_is_raster(page):
-        prims = image_extract.raster_primitives(page)
-    else:
-        prims = vector_primitives(page, scale)
-        if image_extract.text_is_outlined(page, prims.words):
-            prims.words = image_extract.ocr_page_words(page)
-            prims.source = "vector+ocr"
-    return build_page(prims, pno, float(page.width), float(page.height), refdes_color_hint)
+        return image_extract.raster_primitives(page)
+    prims = vector_primitives(page, scale)
+    if image_extract.text_is_outlined(page, prims.words):
+        prims.words = image_extract.ocr_page_words(page)
+        prims.source = "vector+ocr"
+    return prims
+
+
+def extract_page(page, pno: int, refdes_color_hint: tuple = (), scale: Optional[float] = None) -> PageNetlist:
+    """Netlist of one page; pages without vector drawing go through the raster/OCR front-end."""
+    return build_page(page_primitives(page, scale), pno, float(page.width), float(page.height), refdes_color_hint)
 
 
 def _dedupe(items: list, key=lambda v: tuple(round(x, 2) for x in v)) -> list:
@@ -2352,17 +2370,27 @@ class ExtractionCancelled(Exception):
     """Raised by extract_design when its cancel_check returns True."""
 
 
-def _extract_pages(pdf_path: str, pnos: list[int], hint: tuple, scale: Optional[float]) -> list[PageNetlist]:
-    """Worker: netlists of some pages of one PDF (each process opens the file itself)."""
+def _extract_pages(pdf_path: str, pnos: list[int], hint: tuple, scale: Optional[float]) -> list[tuple[PageNetlist, Optional[bytes]]]:
+    """Worker: netlists of some pages of one PDF (each process opens the file itself), each with
+    its drawing primitives pickled so the page can be rebuilt with the document's refdes colour
+    without parsing (or OCR-ing) it again; None for scanned pages, which are never rebuilt."""
     import pdfplumber
 
     out = []
     with pdfplumber.open(pdf_path) as pdf:
         for pno in pnos:
             page = pdf.pages[pno - 1]
-            out.append(extract_page(page, pno, hint, scale))
+            prims = page_primitives(page, scale)
+            # (build_page changes the primitives it is given: pickle them first)
+            blob = None if prims.source == "raster" else pickle.dumps(prims, protocol=pickle.HIGHEST_PROTOCOL)
+            out.append((build_page(prims, pno, float(page.width), float(page.height), hint), blob))
             page.flush_cache()
     return out
+
+
+def _rebuild_pages(jobs: list[tuple[int, float, float, bytes]], hint: tuple) -> list[PageNetlist]:
+    """Worker: rebuild pages from their pickled primitives with another refdes colour hint."""
+    return [build_page(pickle.loads(blob), pno, pw, ph, hint) for pno, pw, ph, blob in jobs]
 
 
 def _refdes_color_votes(pages: Iterable[PageNetlist]) -> dict[tuple, int]:
@@ -2385,33 +2413,12 @@ def _recolour(done: dict[int, PageNetlist]) -> tuple[tuple, list[int]]:
     return hint, [p for p, pn in done.items() if pn.source != "raster" and pn.refdes_color != hint]
 
 
-def _cache_dir() -> Optional[Path]:
-    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~")
-    try:
-        d = Path(base) / "SchematicNetlist" / "cache"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-    except OSError:
-        return None
-
-
-def _cache_key(pdf_path: str, pages: Optional[list[int]]) -> str:
-    """Hash of the PDF bytes, the page selection and the extraction code itself."""
-    h = hashlib.sha1()
-    with open(pdf_path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    h.update(repr(pages).encode())
-    if getattr(sys, "frozen", False):  # packaged exe: the code version is the exe itself
-        st = os.stat(sys.executable)
-        h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
-    here = Path(__file__).parent
-    for name in ("netlist.py", "image_extract.py"):
-        try:
-            h.update((here / name).read_bytes())
-        except OSError:
-            h.update(name.encode())
-    return h.hexdigest()
+def _remove_old_cache() -> None:
+    """Earlier versions kept every extracted netlist in %LOCALAPPDATA%\\SchematicNetlist\\cache
+    (hundreds of MB over time). Nothing is cached any more: delete what they left behind."""
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        shutil.rmtree(Path(base) / "SchematicNetlist" / "cache", ignore_errors=True)
 
 
 def _available_memory_mb() -> Optional[int]:
@@ -2432,15 +2439,32 @@ def _available_memory_mb() -> Optional[int]:
     return int(st.ullAvailPhys // (1024 * 1024))
 
 
+WORKER_MB = 350  # free memory per worker process: ~100 MB peak on vector pages plus the main process's share
+# and headroom (more lets the pool page: on a 7.5 GB laptop with ~0.7 GB free, 4 workers took 92 s
+# for UR5J and 2 workers 69 s)
+
+
 def default_workers(total_pages: int) -> int:
     """Physical cores (pdf parsing gains nothing from hyper-threads), at most 8, at least 4 pages
-    per worker, and no more workers than free memory allows (~500 MB each incl. the libraries)."""
+    per worker, and no more workers than free memory allows (WORKER_MB each incl. the libraries)."""
     cores = max(1, (os.cpu_count() or 2) // 2)
     n = max(1, min(cores, 8, total_pages // 4))
     free = _available_memory_mb()
     if free is not None:
-        n = max(1, min(n, free // 500))
+        n = max(1, min(n, free // WORKER_MB))
     return n
+
+
+def _stop_pool(pool) -> None:
+    """Stop a process pool now: a cancelled run must not wait for the pages still being read."""
+    kill = getattr(pool, "terminate_workers", None)  # Python 3.14+
+    if kill is not None:
+        kill()
+        return
+    procs = list((getattr(pool, "_processes", None) or {}).values())
+    pool.shutdown(wait=False, cancel_futures=True)
+    for p in procs:
+        p.terminate()
 
 
 def extract_design(
@@ -2449,80 +2473,73 @@ def extract_design(
     progress=None,
     cancel_check=None,
     workers: Optional[int] = None,
-    use_cache: bool = True,
 ) -> Design:
-    """Netlist of a whole PDF. Pages are read in parallel processes; the result is cached per
-    PDF content + code version so a re-run with other options takes seconds."""
+    """Netlist of a whole PDF, read afresh every time; pages are read in parallel processes."""
     import pdfplumber
 
+    _remove_old_cache()
     pages = list(pages) if pages else None
-    cache_file = None
-    if use_cache:
-        cdir = _cache_dir()
-        if cdir is not None:
-            cache_file = cdir / f"{_cache_key(pdf_path, pages)}.pkl"
-            if cache_file.exists():
-                try:
-                    with open(cache_file, "rb") as f:
-                        design = pickle.load(f)
-                    if progress:
-                        progress(len(design.pages), len(design.pages))
-                    return design
-                except Exception:
-                    pass
-
     with pdfplumber.open(pdf_path) as pdf:
         idxs = pages or list(range(1, len(pdf.pages) + 1))
     total = len(idxs)
-    scale = document_scale(pdf_path, idxs)
     if workers is None:
         workers = default_workers(total)
 
-    done: dict[int, PageNetlist] = {}
-    if workers <= 1:
-        with pdfplumber.open(pdf_path) as pdf:
-            for n, pno in enumerate(idxs, start=1):
-                if cancel_check is not None and cancel_check():
-                    raise ExtractionCancelled()
-                page = pdf.pages[pno - 1]
-                done[pno] = extract_page(page, pno, (), scale)
-                page.flush_cache()
-                if progress:
-                    progress(n, total)
-            hint, redo = _recolour(done)
-            for pno in redo:
-                page = pdf.pages[pno - 1]
-                done[pno] = extract_page(page, pno, hint, scale)
-                page.flush_cache()
-    else:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+    def cancelled() -> None:
+        if cancel_check is not None and cancel_check():
+            raise ExtractionCancelled()
 
-        chunks = [idxs[i::workers * 2] for i in range(workers * 2)]
-        chunks = [c for c in chunks if c]
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(_extract_pages, pdf_path, c, (), scale): c for c in chunks}
-            for fut in as_completed(futs):
-                if cancel_check is not None and cancel_check():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise ExtractionCancelled()
-                for pn in fut.result():
+    done: dict[int, PageNetlist] = {}
+    blobs: dict[int, bytes] = {}  # page -> pickled primitives, to rebuild it without parsing it again
+    if workers <= 1:
+        scale = document_scale(pdf_path, idxs)
+        for n, pno in enumerate(idxs, start=1):
+            cancelled()
+            pn, blob = _extract_pages(pdf_path, [pno], (), scale)[0]
+            done[pno] = pn
+            if blob is not None:
+                blobs[pno] = blob
+            if progress:
+                progress(n, total)
+        hint, redo = _recolour(done)
+        for pno in redo:
+            cancelled()
+            done[pno] = _rebuild_pages([(pno, done[pno].width, done[pno].height, blobs[pno])], hint)[0]
+    else:
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+
+        def results(futs: list):
+            """Results as they complete; checks for cancellation four times a second."""
+            pending = set(futs)
+            while pending:
+                finished, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                cancelled()
+                for fut in finished:
+                    yield fut.result()
+
+        pool = ProcessPoolExecutor(max_workers=workers)
+        try:
+            # one page per task: the pages are balanced over the workers, progress moves page by
+            # page and a cancel is seen at once (opening the PDF again per task costs next to nothing)
+            scale = _scale_of(s for r in results([pool.submit(_page_text_sizes, pdf_path, [p]) for p in _scale_sample(idxs)]) for s in r)
+            for res in results([pool.submit(_extract_pages, pdf_path, [p], (), scale) for p in idxs]):
+                for pn, blob in res:
                     done[pn.page] = pn
+                    if blob is not None:
+                        blobs[pn.page] = blob
                 if progress:
                     progress(len(done), total)
             hint, redo = _recolour(done)
-            if redo:
-                chunks = [redo[i::workers] for i in range(workers)]
-                for fut in as_completed([pool.submit(_extract_pages, pdf_path, c, hint, scale) for c in chunks if c]):
-                    for pn in fut.result():
-                        done[pn.page] = pn
+            jobs = [pool.submit(_rebuild_pages, [(p, done[p].width, done[p].height, blobs[p])], hint) for p in redo]
+            for res in results(jobs):
+                for pn in res:
+                    done[pn.page] = pn
+        except BaseException:
+            _stop_pool(pool)
+            raise
+        pool.shutdown()
 
     design = build_design([done[p] for p in idxs])
     design.scale = scale or 1.0
     design.raw_scale = scale
-    if cache_file is not None:
-        try:
-            with open(cache_file, "wb") as f:
-                pickle.dump(design, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception:
-            pass
     return design
