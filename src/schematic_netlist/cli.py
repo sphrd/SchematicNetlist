@@ -42,7 +42,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     res = analyze_pdf(
         pdf, name, out_dir, outputs, pages=parse_page_range(args.pages) if args.pages else None,
-        progress=progress, workers=args.workers, use_cache=not args.no_cache,
+        progress=progress, workers=args.workers,
     )
     for line in res.circuit.log:
         print(line)
@@ -70,8 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-excel", action="store_true", help="Skip the Excel analysis report.")
     p.add_argument("--no-spice", action="store_true", help="Skip the HSPICE netlist.")
     p.add_argument("--no-netlist", action="store_true", help="Skip the flat text/JSON netlist.")
-    p.add_argument("--workers", type=int, help="Parallel page readers. Default: one per CPU core (max 8); 1 = sequential.")
-    p.add_argument("--no-cache", action="store_true", help="Re-read the PDF even if a cached netlist of it exists.")
+    p.add_argument("--workers", type=int, help="Parallel page readers. Default: one per physical CPU core (max 8, fewer when memory is short); 1 = sequential.")
     p.set_defaults(func=cmd_analyze)
     return parser
 

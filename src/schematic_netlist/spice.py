@@ -108,6 +108,16 @@ def _pins_in_order(part: Part) -> list[Pin]:
 
 def write_spice(circuit: Circuit, title: str) -> str:
     node = _Names()
+    used_inst: set[str] = set()
+
+    def unique(name: str) -> str:
+        """Element and subcircuit names must be unique too (U-1 and U_1 both sanitize to U_1)."""
+        out, n = name, 1
+        while out.upper() in used_inst:
+            n += 1
+            out = f"{name}_{n}"
+        used_inst.add(out.upper())
+        return out
     for n in circuit.nets:
         if n.is_ground:
             node.map[n.name] = "0"
@@ -149,7 +159,7 @@ def write_spice(circuit: Circuit, title: str) -> str:
         return " ".join(f"{p.number or '?'}" + (f"={p.name}" if p.name else "") for p in _pins_in_order(part))
 
     def subckt(part: Part) -> None:
-        name = f"SUB_{_ident(part.refdes)}"
+        name = unique(f"SUB_{_ident(part.refdes)}")
         ps = _pins_in_order(part)
         ports = [_ident(p.number or p.name or f"p{i}") for i, p in enumerate(ps, start=1)]
         used: set[str] = set()
@@ -167,7 +177,7 @@ def write_spice(circuit: Circuit, title: str) -> str:
         body.append("* (empty stub: add the model or a behavioural description here)")
         body.append(".ENDS")
         subckts.append(body)
-        lines.append(f"X{_ident(part.refdes)} {' '.join(nodes(part))} {name}")
+        lines.append(f"{unique('X' + _ident(part.refdes))} {' '.join(nodes(part))} {name}")
 
     for part in circuit.parts:
         k = part.kind
@@ -182,35 +192,35 @@ def write_spice(circuit: Circuit, title: str) -> str:
         if k in ("resistor", "fuse", "jumper", "switch", "relay coil") and n == 2:
             a, b = nodes(part, 2)
             tag = "" if k == "resistor" else f"  $ {k}"
-            lines.append(f"{_instance('R', part.refdes)} {a} {b} {val(part)}{tag}")
+            lines.append(f"{unique(_instance('R', part.refdes))} {a} {b} {val(part)}{tag}")
         elif k == "relay coil" and n > 2:
             a, b = nodes(part, 2)
-            lines.append(f"{_instance('R', part.refdes)} {a} {b} {val(part)}  $ relay coil on the two lowest pins of {pin_doc(part)}; the others are left open")
+            lines.append(f"{unique(_instance('R', part.refdes))} {a} {b} {val(part)}  $ relay coil on the two lowest pins of {pin_doc(part)}; the others are left open")
         elif k == "capacitor" and n == 2:
             a, b = nodes(part, 2)
-            lines.append(f"{_instance('C', part.refdes)} {a} {b} {val(part)}")
+            lines.append(f"{unique(_instance('C', part.refdes))} {a} {b} {val(part)}")
         elif k in ("inductor", "ferrite bead") and n == 2:
             a, b = nodes(part, 2)
-            lines.append(f"{_instance('L', part.refdes)} {a} {b} {val(part)}" + ("  $ ferrite bead" if k == "ferrite bead" else ""))
+            lines.append(f"{unique(_instance('L', part.refdes))} {a} {b} {val(part)}" + ("  $ ferrite bead" if k == "ferrite bead" else ""))
         elif k == "diode" and n == 2:
             a, b = nodes(part, 2)
             m = f"D_{_ident(part.value or part.refdes)}"
             models.setdefault(m, f".MODEL {m} D")
-            lines.append(f"{_instance('D', part.refdes)} {a} {b} {m}  $ pins {pin_doc(part)}: check anode/cathode")
+            lines.append(f"{unique(_instance('D', part.refdes))} {a} {b} {m}  $ pins {pin_doc(part)}: check anode/cathode")
         elif k == "transistor (BJT)" and n == 3:
             m = f"Q_{_ident(part.value or part.refdes)}"
             models.setdefault(m, f".MODEL {m} NPN")
-            lines.append(f"{_instance('Q', part.refdes)} {' '.join(nodes(part, 3))} {m}  $ pins {pin_doc(part)}: check C B E order")
+            lines.append(f"{unique(_instance('Q', part.refdes))} {' '.join(nodes(part, 3))} {m}  $ pins {pin_doc(part)}: check C B E order")
         elif k == "MOSFET" and n in (3, 4):
             m = f"M_{_ident(part.value or part.refdes)}"
             models.setdefault(m, f".MODEL {m} NMOS")
             ns = nodes(part, 4)
             if len(ns) == 3:
                 ns.append(ns[2])
-            lines.append(f"{_instance('M', part.refdes)} {' '.join(ns)} {m}  $ pins {pin_doc(part)}: check D G S B order")
+            lines.append(f"{unique(_instance('M', part.refdes))} {' '.join(ns)} {m}  $ pins {pin_doc(part)}: check D G S B order")
         elif k in ("source", "battery") and n == 2:
             a, b = nodes(part, 2)
-            lines.append(f"{_instance('V', part.refdes)} {a} {b} DC {val(part)}")
+            lines.append(f"{unique(_instance('V', part.refdes))} {a} {b} DC {val(part)}")
         elif k == "relay contact" and n == 2:
             a, b = nodes(part, 2)
             ctl = coil_nodes.get(part.group)
@@ -221,7 +231,7 @@ def write_spice(circuit: Circuit, title: str) -> str:
                 ctl = (cn, "0")
                 coil_nodes[part.group] = ctl
                 lines.append(f"V{cn} {cn} 0 DC 0  $ relay {part.group}: no coil drawn; set > VT to close its contacts")
-            lines.append(f"{_instance('S', part.refdes)} {a} {b} {ctl[0]} {ctl[1]} {m}  $ relay {part.group} contact")
+            lines.append(f"{unique(_instance('S', part.refdes))} {a} {b} {ctl[0]} {ctl[1]} {m}  $ relay {part.group} contact")
         else:
             subckt(part)
 

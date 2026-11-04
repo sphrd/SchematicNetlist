@@ -57,7 +57,7 @@ def score_case(case: Path, engine_src: str) -> dict:
     xml = next(case.glob("*.xml"))
     gt_refs, gt = gt_netlist(xml)
     t = time.time()
-    d = extract_design(str(pdf), use_cache=False)
+    d = extract_design(str(pdf))
     c = build_circuit(d, pdf.name)
     secs = time.time() - t
 
