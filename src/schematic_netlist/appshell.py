@@ -298,8 +298,8 @@ def pil_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFon
 
 
 def comet_frames(size: int, bg: str, color: str = TOKENS["accent"], frames: int = 60, sweep: float = 270.0) -> list[Image.Image]:
-    """Comet spinner frames (one turn): a tail fading in towards the head and a lighter dot at the head.
-    Stroke max(2.5, 5*size/64), inset 1.5 strokes."""
+    """Comet spinner frames (one turn): a line whose tail fades in towards its head; nothing at the
+    head (no dot). Stroke max(2.5, 5*size/64), inset 1.5 strokes."""
     s = 4
     n = size * s
     w = max(2.5, 5 * size / 64) * s
@@ -316,10 +316,6 @@ def comet_frames(size: int, bg: str, color: str = TOKENS["accent"], frames: int 
         ImageDraw.Draw(layer).arc(box, -sweep + i * step, -sweep + (i + 1) * step + 0.6, fill=color + "%02x" % a,
                                   width=int(round(w)))
         base.alpha_composite(layer)
-    cx, cy, rad = n / 2, n / 2, (n - 2 * inset) / 2
-    hx, hy = cx + rad, cy  # head at 0 degrees (3 o'clock); PIL angles run clockwise like the tail
-    dot = _mix(color, "#ffffff", 0.35)
-    ImageDraw.Draw(base).ellipse((hx - w / 2, hy - w / 2, hx + w / 2, hy + w / 2), fill=dot)
     out = []
     for f in range(frames):
         fr = base.rotate(-360.0 * f / frames, resample=Image.BICUBIC)  # clockwise
@@ -425,7 +421,6 @@ def splash_tcl() -> str:
     A click or Esc closes it (used by `--splash` preview). Goes through PyInstaller's %-formatting."""
     T = {k: v for k, v in TOKENS.items()}
     T["check"] = _mix(T["bg"], T["accent"], 0.63)
-    T["dot"] = _mix(T["accent"], "#ffffff", 0.35)
     tcl = r"""
 font create logFont -family {Segoe UI} -size -12
 set _log {}
@@ -504,9 +499,6 @@ proc _tick {} {
             set q [expr {($k+1.0)/28}]
             $c create arc 38 [expr {$y+3}] 47 [expr {$y+12}] -style arc -start [expr {$head + 270.0 - ($k+1)*$step}] -extent [expr {$step+0.6}] -outline [_mix @bg@ @accent@ [expr {$q*$q}]] -width 2 -tags anim
         }
-        set hx [expr {42.5 + 4.5*cos($head*3.14159265/180)}]
-        set hy [expr {$y + 7.5 - 4.5*sin($head*3.14159265/180)}]
-        $c create oval [expr {$hx-1.2}] [expr {$hy-1.2}] [expr {$hx+1.2}] [expr {$hy+1.2}] -fill @dot@ -width 0 -tags anim
     }
     after 30 _tick
 }

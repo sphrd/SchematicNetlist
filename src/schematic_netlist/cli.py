@@ -5,7 +5,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .analyze import OUTPUTS, analyze_pdf
+from .analyze import OUTPUTS, analyze_pdf, bad_file_name
 from .doctor import format_report, run_checks
 
 
@@ -33,7 +33,11 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 def cmd_analyze(args: argparse.Namespace) -> int:
     pdf = Path(args.pdf)
     name = args.name or pdf.stem
-    out_dir = Path(args.output) if args.output else pdf.parent / pdf.stem
+    bad = bad_file_name(name)
+    if bad:
+        print(f"--name: {bad}", file=sys.stderr)
+        return 2
+    out_dir = Path(args.output) if args.output else pdf.parent / name
     outputs = [o for o in OUTPUTS if not getattr(args, f"no_{o}")]
 
     def progress(i: int, n: int) -> None:
@@ -64,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("analyze", help="Schematic PDF -> <name>_analysis.xlsx, <name>.sp, <name>_netlist.txt/.json, engine log.")
     p.add_argument("pdf", help="Path to the schematic PDF.")
-    p.add_argument("-o", "--output", help="Output folder. Default: a folder named after the PDF, next to it.")
+    p.add_argument("-o", "--output", help="Output folder. Default: a folder named after the project (--name), next to the PDF.")
     p.add_argument("--name", help="Project name used for the output files and the SPICE title. Default: PDF file name.")
     p.add_argument("--pages", help="Page range, e.g. '1-3,5'. Default: all pages.")
     p.add_argument("--no-excel", action="store_true", help="Skip the Excel analysis report.")

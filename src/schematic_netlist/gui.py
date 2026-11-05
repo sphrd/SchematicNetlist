@@ -25,7 +25,7 @@ import pdfplumber
 from PIL import Image, ImageDraw, ImageTk
 
 from . import __version__, appshell
-from .analyze import OUTPUTS, analyze_pdf
+from .analyze import OUTPUTS, analyze_pdf, bad_file_name
 from .netlist import ExtractionCancelled
 
 try:
@@ -408,7 +408,7 @@ class App(_BaseTk):
         )
         self.open_folder_button.pack(side="left")
         tk.Label(
-            result_row, text="Results go to a folder named after the PDF, next to it.", bg=BG, fg=MUTED,
+            result_row, text="Results go to a folder named after the project, next to the PDF.", bg=BG, fg=MUTED,
             font=("Segoe UI", 9),
         ).pack(side="left", padx=10)
 
@@ -506,12 +506,16 @@ class App(_BaseTk):
         if not name:
             messagebox.showwarning("Missing name", "Enter a project name first.")
             return
+        bad = bad_file_name(name)
+        if bad:
+            messagebox.showwarning("Invalid name", f"The project name names the output folder and files: {bad}")
+            return
         outputs = [k for k in OUTPUTS if self.output_vars[k].get()]
         if not outputs:
             messagebox.showwarning("No outputs", "Tick at least one output.")
             return
 
-        self._out_dir = self.pdf_path.parent / self.pdf_path.stem
+        self._out_dir = self.pdf_path.parent / name
         self.run_button.config(state="disabled", text="Working...")
         self.open_folder_button.config(state="disabled")
         self._set_log("")
