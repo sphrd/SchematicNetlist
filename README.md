@@ -18,7 +18,8 @@ analysis report. One Windows app, nothing to install; also a Python package with
 3. Check the **Project name** and the outputs you want, click **Analyze schematic**, then
    **Open output folder**.
 
-Results go to a folder **named after the PDF, next to it** (`Board.pdf` → `Board\`):
+Results go to a folder **named after the project, next to the PDF**. The project name is filled
+in from the PDF name, so by default `Board.pdf` → `Board\`; name it `MyBoard` → `MyBoard\`:
 
 | File | Content |
 |---|---|

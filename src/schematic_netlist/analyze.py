@@ -12,6 +12,19 @@ from .report_excel import write_report
 from .spice import write_spice
 
 OUTPUTS = ("excel", "spice", "netlist")
+_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def bad_file_name(name: str) -> Optional[str]:
+    """Why ``name`` can't name the output folder and files on Windows; None when it can."""
+    bad = sorted({c for c in name if c in '<>:"/\\|?*' or ord(c) < 32})
+    if bad:
+        return "it can't contain " + " ".join(bad) + "."
+    if name != name.rstrip(" ."):
+        return "it can't end with a space or a dot."
+    if name.split(".")[0].upper() in _RESERVED:
+        return f"{name.split('.')[0]} is reserved by Windows."
+    return None
 
 
 @dataclass
