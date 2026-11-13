@@ -49,6 +49,11 @@ The engine works on the **vector drawing** of the PDF, the way every ECAD tool e
   Graphics drawn *inside* a box symbol (a coil in its rectangle, an internal switch diagram,
   an amplifier triangle, polarity marks) are body, never wires; a small "×" at a wire end is a
   no-connect mark; a short bar with free parallel prongs is a ground symbol drawn in lines;
+* text drawn invisibly (the navigation tags CAD tools hide in their PDF exports) is ignored when the
+  page has visible text; a PDF that carries its CAD netlist in its bookmarks (an Altium "smart PDF")
+  has it read: each listed pin is placed by its hidden tag, and the drawn pin there takes its exact
+  net name (equal names join across pages), pin number and designator; a wire the drawing joined
+  across two CAD nets is split;
 * reference designators, pin numbers, pin names (inside boxes) and net labels are placed by
   position, rotated text included; equal net labels join nets across pages. When the drawing
   prints designators in their own colour, free-form names in that colour (`R_SHUNT_1`,
@@ -59,7 +64,7 @@ The engine works on the **vector drawing** of the PDF, the way every ECAD tool e
   numbered pins, is a **block** (sheet symbol / unannotated device) even without a designator
   (named by its title, else `BOX<page>.<n>`); placeholder designators of an unannotated draft
   (`R?`, `U?`) make parts too, named `R?<page>.<n>`;
-* **scanned / image-only pages** are read with OpenCV + Tesseract OCR into the same model
+* **scanned / image-only pages** are read with OpenCV + RapidOCR (PP-OCRv6 models, built in) into the same model
   (less reliable — the log lists those pages); on vector pages, embedded pictures big enough to
   hold text (a pasted table or drawing) are OCR'd region by region — logos repeated on several
   pages are skipped — and every region read is listed in the log (a pasted drawing's graphics
@@ -100,7 +105,8 @@ Windows 10/11 64-bit for the exe (no Python, no admin). The PDF must be in a wri
 * Values are read from text near the symbol — a crowded drawing can attach the wrong one.
 * Pin roles of semiconductors (A/K, C/B/E, D/G/S) are not known from a drawing; the deck
   keeps pin-number order and says so in a comment.
-* Scanned pages: expect roughly half the labels of a clean vector page; check them by hand.
+* Scanned pages: OCR reads about 60 % of the words of a clean vector page (designators ~80 %,
+  pogo labels ~90 %, pin numbers ~50 %); check them by hand. Vertical text reads worst.
 
 ---
 
@@ -108,8 +114,7 @@ Windows 10/11 64-bit for the exe (no Python, no admin). The PDF must be in a wri
 
 ```powershell
 uv venv
-uv pip install -e ".[image,gui,dev]"      # image = OCR for scanned pages, gui = drag-and-drop, dev = PyInstaller
-winget install UB-Mannheim.TesseractOCR   # OCR engine (found in its default folder even if not on PATH)
+uv pip install -e ".[image,gui,dev]"      # image = OCR for scanned pages (RapidOCR, models included), gui = drag-and-drop, dev = PyInstaller
 .venv\Scripts\schematic-netlist.exe doctor
 ```
 
@@ -121,9 +126,10 @@ schematic-netlist-gui
 Pages are read in parallel processes (one per physical core, max 8, fewer when free memory is
 short; the log states the count and why), heaviest pages first so no reader is left alone with
 the biggest page at the end. Every run reads the PDF afresh; nothing is cached (the cache folder of earlier versions,
-`%LOCALAPPDATA%\SchematicNetlist\cache`, is deleted on the first run).
+`%LOCALAPPDATA%\SchematicNetlist\cache`, is deleted on the first run, and so is the Tesseract copy
+they unpacked there, `tesseract-*`).
 
-Build the exe (bundles Tesseract, ~110 MB): `.\build.ps1` (first time `.\build.ps1 -Setup` creates `.venv`) -> `.\SchematicNetlist.exe`.
+Build the exe (bundles the OCR engine and its models): `.\build.ps1` (first time `.\build.ps1 -Setup` creates `.venv`) -> `.\SchematicNetlist.exe`.
 Headless use of the exe: `SchematicNetlist.exe --cli analyze board.pdf`; `--cli update [--restart]`
 updates the exe in place from the latest release. `SchematicNetlist.exe --splash` shows the
 start-up splash until it is clicked or Esc is pressed.
@@ -146,7 +152,7 @@ not depend on the drawing size).
 | Module | Role |
 |---|---|
 | `netlist.py` | drawing primitives → wires, symbols, pins, labels, cross-page nets (`Design`) |
-| `image_extract.py` | scanned pages: OpenCV + Tesseract → the same primitives |
+| `image_extract.py` | scanned pages and embedded pictures: OpenCV + RapidOCR → the same primitives |
 | `circuit.py` | `Design` → typed parts, named nets, rails, warnings (`Circuit`) |
 | `spice.py`, `netlist_export.py`, `report_excel.py` | writers |
 | `analyze.py` | one call PDF → all files (used by `cli.py` and `gui.py`) |

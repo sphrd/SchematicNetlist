@@ -3,26 +3,18 @@
 Recovers from pixels the same primitives the vector path reads from the PDF -- orthogonal
 wire segments, junction dots, symbol blobs, boxes and words -- so `netlist.build_page`
 treats both kinds of page identically. Needs the `image` extra (opencv-python-headless,
-pytesseract, numpy); OCR also needs the Tesseract binary unless the page has a text layer.
+rapidocr + onnxruntime, numpy). OCR is RapidOCR with the PP-OCRv6 models that ship inside
+its package: nothing to install or download.
 """
 from __future__ import annotations
 
-import os
 import re
-import shutil
-import sys
-from pathlib import Path
 
 from .netlist import DOT_MAX, Primitives, Word
 
-_TESSERACT_HINTS = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-]
-_OCR_MIN_CONF = 30
-_OCR_SHORT_MIN_CONF = 70  # 1-2 character tokens: symbols (chevrons, contacts) are often misread as such
-_OCR_ROTATED_MIN_CONF = 60
-OCR_GLYPH_PX = 32  # glyph height Tesseract reads best
+_OCR_MIN_SCORE = 0.5  # RapidOCR line confidence below this is noise (symbol strokes read as letters)
+OCR_TILE_PX = 1600  # RapidOCR shrinks anything over 2000 px: a page is read in overlapping tiles
+OCR_TILE_OVERLAP_PX = 240  # more than the longest label is tall, so every token lies whole in some tile
 _TOKEN_TRIM = re.compile(r"^[^A-Za-z0-9+]+|[^A-Za-z0-9)%]+$")
 _OCR_DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "|": "1", "S": "5", "B": "8", "Z": "2"})
 
@@ -57,7 +49,7 @@ REGION_TABLE_BOX_COVER = 0.3  # boxes (below half the picture: no frame) coverin
 
 def _require_image_deps() -> None:
     missing = []
-    for mod, pkg in (("cv2", "opencv-python-headless"), ("pytesseract", "pytesseract"), ("numpy", "numpy")):
+    for mod, pkg in (("cv2", "opencv-python-headless"), ("rapidocr", "rapidocr"), ("onnxruntime", "onnxruntime"), ("numpy", "numpy")):
         try:
             __import__(mod)
         except ImportError:
@@ -66,43 +58,21 @@ def _require_image_deps() -> None:
         raise RuntimeError(
             "This page has no vector drawing (scanned/flattened), and reading it needs: "
             + ", ".join(missing)
-            + '.\nInstall with:  uv pip install -e ".[image]"  (and the Tesseract engine: '
-            "winget install UB-Mannheim.TesseractOCR)"
+            + '.\nInstall with:  uv pip install -e ".[image]"'
         )
 
 
-TESSERACT_ZIP = "tesseract.zip"  # packed into SchematicNetlist.exe by src/build_exe.py
+_ENGINE = None
 
 
-def _bundled_tesseract() -> str | None:
-    """SchematicNetlist.exe carries Tesseract + the English model as one zip; it is unpacked the
-    first time OCR is needed (not at every start) into %LOCALAPPDATA% and reused afterwards."""
-    packed = Path(getattr(sys, "_MEIPASS", "")) / TESSERACT_ZIP
-    if not getattr(sys, "frozen", False) or not packed.exists():
-        return None
-    base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "SchematicNetlist"
-    target = base / f"tesseract-{packed.stat().st_size}"
-    exe = target / "tesseract.exe"
-    if not exe.exists():
-        import zipfile
+def ocr_engine():
+    """The RapidOCR engine (PP-OCRv6 detection + recognition), loaded once per process."""
+    global _ENGINE
+    if _ENGINE is None:
+        from rapidocr import RapidOCR
 
-        tmp = target.with_name(target.name + ".partial")
-        shutil.rmtree(tmp, ignore_errors=True)
-        with zipfile.ZipFile(packed) as z:
-            z.extractall(tmp)
-        tmp.replace(target)
-    os.environ["TESSDATA_PREFIX"] = str(target / "tessdata")
-    return str(exe)
-
-
-def find_tesseract() -> str | None:
-    bundled = _bundled_tesseract()
-    if bundled:
-        return bundled
-    path = shutil.which("tesseract")
-    if path:
-        return path
-    return next((h for h in _TESSERACT_HINTS if Path(h).exists()), None)
+        _ENGINE = RapidOCR(params={"Global.log_level": "critical"})
+    return _ENGINE
 
 
 def page_is_raster(page) -> bool:
@@ -126,7 +96,7 @@ def text_is_outlined(page, words: list[Word]) -> bool:
 
 
 def ocr_page_words(page, resolution: int = 300) -> list[Word]:
-    """Words of a rendered page via Tesseract (for vector pages without a text layer)."""
+    """Words of a rendered page via OCR (for vector pages without a text layer)."""
     _require_image_deps()
     import numpy as np
 
@@ -139,9 +109,11 @@ def _clean_token(text: str) -> str:
     t = _TOKEN_TRIM.sub("", text.strip())
     if len(t) >= 4 and sum(c.isdigit() for c in t) >= 0.75 * len(t):
         return t.translate(_OCR_DIGIT_FIX)
+    # the short hyphen after a pogo block number reads as a dot or comma: 416.P16 -> 416-P16
+    t = re.sub(r"^(\d{3})[.,·•](?=[A-Z])", r"\1-", t)
     # O/0 inside codes such as 893-F03OUT1: a zero before two letters is an O, an O next to a digit a zero
     t = re.sub(r"0(?=[A-Z]{2})", "O", t)
-    t = re.sub(r"(?<=[A-Z])O(?=\d)|(?<=\d)O(?=\d)|(?<=\d)O\b", "0", t)
+    t = re.sub(r"(?<=[A-Z])O(?=\d)|(?<=\d)O(?=\d)|(?<=\d)O\b|(?<=\d)O(?=OUT\d)", "0", t)
     # a pin code must end in its channel number: 431-HFS -> 431-HF5
     m = re.match(r"^(\d{3}-[A-Z]{1,2})([SOIlBZ])$", t)
     if m:
@@ -159,91 +131,92 @@ def _text_layer_words(page) -> list[Word]:
     ]
 
 
+def _line_tokens(text: str, x0: float, x1: float) -> list[tuple[str, float, float]]:
+    """A read line split at its spaces; each token's span is proportional to its characters."""
+    n = max(len(text), 1)
+    return [(m.group(), x0 + (x1 - x0) * m.start() / n, x0 + (x1 - x0) * m.end() / n) for m in re.finditer(r"\S+", text)]
+
+
 def _ocr_words(gray, scale: float) -> list[Word]:
+    """Words of one rendered image (a page or a picture region), in pt. RapidOCR reads the raw
+    image: erasing wires or binarizing first loses text on coloured table cells. Big images are
+    read in overlapping tiles; a token cut by a tile edge is taken from the tile holding it whole.
+    Vertical text needs no second pass: the detector finds it and the recognizer turns it."""
     import cv2
-    import numpy as np
-    import pytesseract
 
-    cmd = find_tesseract()
-    if cmd is None:
-        raise RuntimeError(
-            "This page has no vector drawing and no text layer, so it needs OCR, but the Tesseract "
-            "engine was not found. Install it:  winget install UB-Mannheim.TesseractOCR"
-        )
-    pytesseract.pytesseract.tesseract_cmd = cmd
-    config = "--psm 11 --oem 1"  # sparse text; a character whitelist makes the LSTM model worse
-    # schematic text is ~3.5 pt; Tesseract wants ~30 px glyphs, so upsample small renders
-    up = max(1.0, OCR_GLYPH_PX / (3.5 * scale))
-    s = scale * up
-
-    # wires touching text break Tesseract's segmentation: erase long strokes first
+    engine = ocr_engine()
+    H, W = gray.shape
+    T, O = OCR_TILE_PX, OCR_TILE_OVERLAP_PX
+    found: list[Word] = []
+    by_text: dict[str, list[Word]] = {}
+    for ty in range(0, max(1, H - O), T - O):
+        for tx in range(0, max(1, W - O), T - O):
+            tile = gray[ty:ty + T, tx:tx + T]
+            if tile.size == 0 or tile.min() > 200:
+                continue  # blank paper
+            th, tw = tile.shape
+            res = engine(cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR))
+            if res.txts is None:
+                continue
+            for txt, sc, box in zip(res.txts, res.scores, res.boxes):
+                if sc < _OCR_MIN_SCORE:
+                    continue
+                xs, ys = [p[0] for p in box], [p[1] for p in box]
+                # the detector's line box carries a margin (measured: 0.18 of its height above and on
+                # each side, 0.06 below); trim it to the glyphs, like the boxes of a text layer
+                bh = max(ys) - min(ys)
+                ly0, ly1 = min(ys) + ty + 0.18 * bh, max(ys) + ty - 0.06 * bh
+                for tok, a, b in _line_tokens(txt, min(xs) + tx + 0.18 * bh, max(xs) + tx - 0.18 * bh):
+                    cut = (a - tx < 3 and tx > 0) or (ly0 - ty < 3 and ty > 0) or (tx + tw - b < 3 and tx + tw < W) or (ty + th - ly1 < 3 and ty + th < H)
+                    text = _clean_token(tok)
+                    if cut or not text:
+                        continue
+                    w = Word(text, a / scale, ly0 / scale, b / scale, ly1 / scale)
+                    # tiles overlap: the same token read by two tiles counts once
+                    same = by_text.setdefault(text, [])
+                    if not any(_overlap(v, w) > 0.5 for v in same):
+                        same.append(w)
+                        found.append(w)
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    k = max(3, int(OCR_ERASE_PT * scale))
-    long_strokes = cv2.bitwise_or(
-        cv2.morphologyEx(ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1))),
-        cv2.morphologyEx(ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, k))),
-    )
-    gray = gray.copy()
-    gray[cv2.dilate(long_strokes, np.ones((3, 3), np.uint8)) > 0] = 255
-    # light-grey text (a common label colour) reads far better stretched to full contrast
-    ink_level = int(np.percentile(gray[ink > 0], 90)) if (ink > 0).any() else 0
-    gray = cv2.normalize(np.clip(gray, 0, max(ink_level + 60, 128)), None, 0, 255, cv2.NORM_MINMAX)
+    return _join_underscores(found, ink, scale)
 
-    def read(img, to_pdf, min_conf: int) -> list[Word]:
-        if up > 1.0:
-            img = cv2.resize(img, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
-        data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
-        found = []
-        for i, raw in enumerate(data["text"]):
-            text = _clean_token(raw or "")
-            conf = float(data["conf"][i])
-            if text and conf >= (min_conf if len(text) >= 3 else _OCR_SHORT_MIN_CONF):
-                found.append(Word(text, *to_pdf(data["left"][i], data["top"][i], data["width"][i], data["height"][i])))
-        return found
 
-    words = read(gray, lambda l, t, w, h: (l / s, t / s, (l + w) / s, (t + h) / s), _OCR_MIN_CONF)
-
-    # vertical text (rotated labels, pin numbers of vertical pins): OCR the page turned 90 deg clockwise
-    H = gray.shape[0] * up
-    rotated = read(
-        cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE),
-        lambda l, t, w, h: (t / s, (H - (l + w)) / s, (t + h) / s, (H - l) / s),
-        _OCR_ROTATED_MIN_CONF,
-    )
-    for w in rotated:
-        if len(w.text) >= 2 and not any(
-            w.x0 < v.x1 and v.x0 < w.x1 and w.top < v.bottom and v.top < w.bottom for v in words
-        ):
-            words.append(w)
-    return _join_underscores(words, ink, scale)
+def _overlap(a: Word, b: Word) -> float:
+    """Intersection over the smaller of two word boxes."""
+    w = min(a.x1, b.x1) - max(a.x0, b.x0)
+    h = min(a.bottom, b.bottom) - max(a.top, b.top)
+    if w <= 0 or h <= 0:
+        return 0.0
+    return w * h / max(1e-9, min((a.x1 - a.x0) * (a.bottom - a.top), (b.x1 - b.x0) * (b.bottom - b.top)))
 
 
 def _ocr_rows(gray, rows: list[tuple[int, int, int, int]], scale: float) -> list[Word]:
-    """Second OCR pass: each text row the page-level pass missed, cropped and read as one line."""
+    """Second OCR pass: each text row the page-level pass missed, cropped and read as one line
+    (recognition only, no detection)."""
     import cv2
-    import pytesseract
 
+    engine = ocr_engine()
     pad = int(1.0 * scale)
     H, W = gray.shape
     out: list[Word] = []
     for x0, y0, x1, y1 in rows:
         cx0, cy0, cx1, cy1 = max(0, x0 - pad), max(0, y0 - pad), min(W, x1 + pad), min(H, y1 + pad)
         crop = gray[cy0:cy1, cx0:cx1]
-        up = max(1.0, OCR_GLYPH_PX / max(y1 - y0, 1))
-        crop = cv2.resize(crop, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
-        crop = cv2.copyMakeBorder(crop, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
-        data = pytesseract.image_to_data(crop, config="--psm 7 --oem 1", output_type=pytesseract.Output.DICT)
-        for i, raw in enumerate(data["text"]):
-            text = _clean_token(raw or "")
-            if len(text) >= 3 and float(data["conf"][i]) >= _OCR_MIN_CONF:
-                l, t = (data["left"][i] - 10) / up + cx0, (data["top"][i] - 10) / up + cy0
-                w, h = data["width"][i] / up, data["height"][i] / up
-                out.append(Word(text, l / scale, t / scale, (l + w) / scale, (t + h) / scale))
+        if crop.size == 0:
+            continue
+        res = engine(cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR), use_det=False, use_cls=False)
+        for txt, sc in zip(res.txts or (), res.scores or ()):
+            if sc < _OCR_MIN_SCORE:
+                continue
+            for tok, a, b in _line_tokens(txt, x0, x1):
+                text = _clean_token(tok)
+                if len(text) >= 3:
+                    out.append(Word(text, a / scale, y0 / scale, b / scale, y1 / scale))
     return out
 
 
 def _join_underscores(words: list[Word], ink, scale: float) -> list[Word]:
-    """Tesseract drops underscores and splits there (J2_1 -> J2, 1): rejoin neighbours on one
+    """OCR may drop an underscore and split there (J2_1 -> J2, 1): rejoin neighbours on one
     line whose gap holds a baseline stroke."""
     H, W = ink.shape
     words = sorted(words, key=lambda w: (round(w.top), w.x0))
