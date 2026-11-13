@@ -308,6 +308,87 @@ def _color(obj: dict, key: str) -> tuple:
     return ()
 
 
+_PDFIUM_DOCS: dict = {}  # path -> pypdfium2 document, opened once per process
+
+
+def _pdfium_font(R, tp, i: int) -> str:
+    """Base font name of character i of a pdfium text page, without the subset prefix (ABCDEF+)."""
+    import ctypes
+
+    buf = ctypes.create_string_buffer(256)
+    n = R.FPDFText_GetFontInfo(tp.raw, i, buf, 256, None)
+    return buf.value.decode("utf-8", "replace").split("+")[-1] if n else ""
+
+
+def visible_text(page):
+    """The page without its INVISIBLE text (render mode 3) when it also has visible text. CAD tools
+    hide navigation tags in their PDF exports this way (Altium: PI<part><pin>, CO<part> stacked on
+    every pin and part, and an invisible copy laid over each visible label); nobody sees them, so
+    they are no drawing text. A page whose text is ALL invisible (a searchable scan's OCR layer)
+    keeps it."""
+    path = getattr(getattr(getattr(page, "pdf", None), "stream", None), "name", None)
+    if not path or not page.chars:
+        return page
+    try:
+        import ctypes
+
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as R
+
+        doc = _PDFIUM_DOCS.get(path)
+        if doc is None:
+            doc = _PDFIUM_DOCS[path] = pdfium.PdfDocument(path)
+        pg = doc[page.page_number - 1]
+        tp = pg.get_textpage()
+        hidden: dict[tuple, list[tuple[str, float, float, str]]] = defaultdict(list)
+        objs: dict[int, tuple[bool, str]] = {}  # text object -> (invisible, font)
+        shown = 0
+        fonts_shown: set[str] = set()
+        fonts_hidden: set[str] = set()
+        for i in range(tp.count_chars()):
+            obj = R.FPDFText_GetTextObject(tp.raw, i)
+            if not obj:
+                continue
+            key = ctypes.cast(obj, ctypes.c_void_p).value
+            info = objs.get(key)
+            if info is None:
+                info = objs[key] = (R.FPDFTextObj_GetTextRenderMode(obj) == 3, _pdfium_font(R, tp, i))
+            if not info[0]:
+                shown += 1
+                fonts_shown.add(info[1])
+                continue
+            fonts_hidden.add(info[1])
+            x0, y0, x1, y1 = tp.get_charbox(i)
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            hidden[(int(cx // 4), int(cy // 4))].append((chr(R.FPDFText_GetUnicode(tp.raw, i)), cx, cy, info[1]))
+        tp.close()
+        pg.close()
+    except Exception:
+        return page
+    if not hidden or shown < 10:
+        return page
+    hidden_only = fonts_hidden - fonts_shown  # a font used for nothing but invisible text
+    # a visible glyph and an invisible copy of it at the same spot are told apart by their font; each
+    # invisible glyph removes one character
+    left = {k: list(v) for k, v in hidden.items()}
+    drop: set[int] = set()
+    for c in page.chars:
+        font = str(c.get("fontname", "")).split("+")[-1]
+        if font in hidden_only:
+            drop.add(id(c))
+            continue
+        x0, x1, y0, y1 = c["x0"], c["x1"], c["y0"], c["y1"]
+        cell = left.get((int((x0 + x1) / 2 // 4), int((y0 + y1) / 2 // 4)))
+        if not cell:
+            continue
+        for j, (t, cx, cy, f) in enumerate(cell):
+            if t == c.get("text") and f == font and x0 <= cx <= x1 and y0 <= cy <= y1:
+                drop.add(id(c))
+                del cell[j]
+                break
+    return page.filter(lambda o: id(o) not in drop) if drop else page
+
+
 def _legible_floor(sizes: list[float]) -> float:
     """Font sizes under this are hidden fields / annotation (e.g. invisible 0.7 pt footprint text)."""
     s = sorted(sizes)
@@ -340,7 +421,7 @@ def _page_text_sizes(pdf_path: str, pnos: list[int]) -> list[Optional[float]]:
     with pdfplumber.open(pdf_path) as pdf:
         for pno in pnos:
             page = pdf.pages[pno - 1]
-            out.append(page_text_size(page))
+            out.append(page_text_size(visible_text(page)))
             page.flush_cache()
     return out
 
@@ -550,6 +631,7 @@ def page_words(page, min_size: float = 0.0, scale: float = 1.0) -> list[Word]:
 
 def vector_primitives(page, scale: Optional[float] = None) -> Primitives:
     """``scale``: the document's (see document_scale); None reads it from this page's text."""
+    page = visible_text(page)
     ts = page_text_size(page)
     if scale is None:
         scale = ts / TEXT_UNIT if ts is not None else 1.0
@@ -2424,6 +2506,151 @@ class ExtractionCancelled(Exception):
     """Raised by extract_design when its cancel_check returns True."""
 
 
+# --------------------------------------------------------------------------- CAD netlist inside the PDF
+CAD_PIN_TOL = 1.0  # a drawn pin end this close to a pin tag's box (pt) is that pin
+# ... or the tag box lies back along its pin line within this many pt (times the drawing scale): the
+# tag covers the outer part of the pin, the drawn pin end can sit where the pin meets the body
+CAD_PIN_REACH = 10.0
+
+
+def pdf_cad_pins(pdf_path: str, pages: Optional[Iterable[int]] = None) -> dict[int, list[tuple[str, str, str, tuple]]]:
+    """Page -> [(net name, part, pin, pin box)] of every pin the CAD tool wrote into the PDF itself. An Altium
+    "smart PDF" lists the exact netlist in its bookmarks (<sheet>/Nets/<net>/Pins/<part>-<pin>)
+    and draws an invisible tag PI<part>0<pin> (other non-alphanumerics also written as 0) over
+    each pin, which places every listed pin on its page. Box in pt, top-left origin. Empty when
+    the PDF carries no such netlist."""
+    import ctypes
+
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as R
+
+    want = set(pages) if pages else None
+    enc = lambda s: re.sub(r"[^A-Za-z0-9]", "0", s)  # noqa: E731
+    wanted: dict[int, dict[str, tuple[str, str, str]]] = defaultdict(dict)  # page -> tag -> (net, part, pin)
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        path: list[Optional[str]] = [None] * 16
+        for b in doc.get_toc(max_depth=12):
+            lv = b.level
+            if lv >= 16:
+                continue
+            path[lv] = b.get_title()
+            if lv < 3 or path[lv - 1] != "Pins" or path[lv - 3] != "Nets":
+                continue
+            part, _, pin = path[lv].rpartition("-")
+            dest = b.get_dest()
+            if not part or dest is None:
+                continue
+            pno = dest.get_index() + 1
+            if want is None or pno in want:
+                wanted[pno][f"PI{enc(part)}0{enc(pin)}"] = (path[lv - 2], part, pin)
+        out: dict[int, list[tuple[str, str, str, tuple]]] = {}
+        for pno, tags in wanted.items():
+            pg = doc[pno - 1]
+            tp = pg.get_textpage()
+            H = pg.get_height()
+            seen: set[str] = set()
+            found = []
+            for o in pg.get_objects(filter=[R.FPDF_PAGEOBJ_TEXT], max_depth=5):
+                if R.FPDFTextObj_GetTextRenderMode(o.raw) != 3:
+                    continue
+                n = R.FPDFTextObj_GetText(o.raw, tp.raw, None, 0)
+                buf = (ctypes.c_ushort * n)()
+                R.FPDFTextObj_GetText(o.raw, tp.raw, buf, n)
+                s = bytes(buf).decode("utf-16-le", "replace").rstrip("\x00").strip()
+                if s in tags and s not in seen:
+                    seen.add(s)
+                    x0, y0, x1, y1 = o.get_bounds()
+                    found.append((*tags[s], (x0, H - y1, x1, H - y0)))
+            tp.close()
+            pg.close()
+            if found:
+                out[pno] = found
+        return out
+    finally:
+        doc.close()
+
+
+def _apply_cad_pins(pages: list[PageNetlist], cad: dict[int, list[tuple[str, str, str, tuple]]]) -> dict[str, int]:
+    """Bring the CAD netlist into the drawn netlist. Every drawn pin end inside a pin tag's box is
+    that CAD pin:
+    * its net gets the CAD net name as a label, so equal names join nets across pages (build_design);
+      a drawn net holding pins of DIFFERENT CAD nets (a wire read through a junction it does not
+      make) is split, each such pin moving to a net of its own CAD name;
+    * it takes the CAD pin number when the drawing gave none or another one;
+    * its part takes the CAD designator when the drawing gave it none (BOX4.1, R?4.2) or one the
+      CAD netlist does not know (a value or part number read as the designator).
+    Returns counts for the log."""
+    st = Counter()
+    for pn in pages:
+        boxes = cad.get(pn.page)
+        if not boxes:
+            continue
+        g = Grid(10.0)
+        tol = CAD_PIN_TOL
+        for k, (*_x, b) in enumerate(boxes):
+            g.add(k, b[0] - tol, b[1] - tol, b[2] + tol, b[3] + tol)
+        by_net: dict[int, dict[str, list[Terminal]]] = defaultdict(lambda: defaultdict(list))
+        parts_of: dict[int, Counter] = defaultdict(Counter)  # component -> CAD parts of its pins
+        reach = CAD_PIN_REACH * pn.scale
+        for t in pn.terminals:
+            hits = {
+                boxes[k][:3] for k in g.query(t.x, t.y, t.x, t.y)
+                if boxes[k][3][0] - tol <= t.x <= boxes[k][3][2] + tol and boxes[k][3][1] - tol <= t.y <= boxes[k][3][3] + tol
+            }
+            if not hits:
+                # walk back along the pin line (away from the symbol) to the nearest tag box on it
+                ex, ey = t.x - t.dx * reach, t.y - t.dy * reach
+                best = None
+                for k in g.query(min(t.x, ex), min(t.y, ey), max(t.x, ex), max(t.y, ey)):
+                    b = boxes[k][3]
+                    if abs(t.dy) < 0.5:
+                        if not b[1] - tol <= t.y <= b[3] + tol:
+                            continue
+                        along = (t.x - b[2]) if t.dx > 0 else (b[0] - t.x)
+                    else:
+                        if not b[0] - tol <= t.x <= b[2] + tol:
+                            continue
+                        along = (t.y - b[3]) if t.dy > 0 else (b[1] - t.y)
+                    if -tol <= along <= reach and (best is None or along < best[0]):
+                        best = (along, boxes[k][:3])
+                if best is not None:
+                    hits = {best[1]}
+            if len(hits) != 1:
+                continue
+            net, part, pin = hits.pop()
+            by_net[t.net][net].append(t)
+            st["matched"] += 1
+            if t.comp is not None:
+                if t.pin != pin:
+                    st["pin numbers set" if not t.pin else "pin numbers corrected"] += 1
+                    t.pin = pin
+                parts_of[t.comp][part] += 1
+        for ci, votes in parts_of.items():
+            c = pn.components[ci]
+            part, n = votes.most_common(1)[0]
+            known = {p for p, _ in votes.items()}
+            if any(r == part or re.fullmatch(re.escape(part) + r"[A-Z]{1,3}", r) for r in c.refdes):
+                continue  # the drawing's designator (or a unit of it: J2_1AS for J2_1) agrees
+            if any(r in known for r in c.refdes):
+                continue  # several CAD parts drawn as one symbol: keep the drawing's names
+            c.refdes = [part]
+            st["parts named"] += 1
+        next_id = max(list(pn.seg_net) + [t.net for t in pn.terminals] + [0]) + 1
+        for net, groups in by_net.items():
+            if len(groups) > 1:
+                st["nets split"] += 1
+                for name, ts in groups.items():
+                    for t in ts:
+                        t.net = next_id
+                    pn.labels.append((name, next_id, Word(name, ts[0].x, ts[0].y, ts[0].x, ts[0].y, role="label")))
+                    next_id += 1
+            else:
+                name, ts = next(iter(groups.items()))
+                pn.labels.append((name, net, Word(name, ts[0].x, ts[0].y, ts[0].x, ts[0].y, role="label")))
+            st["nets named"] += 1
+    return dict(st)
+
 def _extract_pages(
     pdf_path: str, pnos: list[int], hint: tuple, scale: Optional[float], logo_sizes: frozenset = frozenset()
 ) -> list[tuple[PageNetlist, Optional[bytes]]]:
@@ -2471,10 +2698,14 @@ def _recolour(done: dict[int, PageNetlist]) -> tuple[tuple, list[int]]:
 
 def _remove_old_cache() -> None:
     """Earlier versions kept every extracted netlist in %LOCALAPPDATA%\\SchematicNetlist\\cache
-    (hundreds of MB over time). Nothing is cached any more: delete what they left behind."""
+    (hundreds of MB over time) and unpacked their bundled Tesseract OCR into tesseract-<size>
+    folders there. Neither is used any more: delete what they left behind."""
     base = os.environ.get("LOCALAPPDATA")
     if base:
-        shutil.rmtree(Path(base) / "SchematicNetlist" / "cache", ignore_errors=True)
+        app = Path(base) / "SchematicNetlist"
+        shutil.rmtree(app / "cache", ignore_errors=True)
+        for old in app.glob("tesseract-*"):
+            shutil.rmtree(old, ignore_errors=True)
 
 
 def _available_memory_mb() -> Optional[int]:
@@ -2647,6 +2878,22 @@ def extract_design(
             raise
         pool.shutdown()
 
+    try:
+        cad = pdf_cad_pins(pdf_path, idxs)
+    except Exception as e:  # a damaged outline must never stop the drawing being read
+        cad = {}
+        notes.append(f"CAD netlist in the PDF bookmarks could not be read ({e}): nets come from the drawing only")
+    if cad:
+        n_pins = sum(len(v) for v in cad.values())
+        n_nets = len({e[0] for v in cad.values() for e in v})
+        st = _apply_cad_pins([done[p] for p in idxs], cad)
+        notes.append(
+            f"CAD netlist found in the PDF (bookmarks of an Altium smart PDF): {n_nets} nets, {n_pins} pins; "
+            f"{st.get('matched', 0)} drawn pin ends matched to their CAD pin, {st.get('nets named', 0)} drawn nets named "
+            f"after their CAD net, {st.get('pin numbers set', 0)} pin numbers filled in and {st.get('pin numbers corrected', 0)} "
+            f"corrected, {st.get('parts named', 0)} parts named after their CAD designator"
+            + (f", {st['nets split']} drawn net(s) split because they joined different CAD nets" if st.get("nets split") else "")
+        )
     design = build_design([done[p] for p in idxs])
     design.scale = scale or 1.0
     design.raw_scale = scale

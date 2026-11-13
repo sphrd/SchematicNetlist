@@ -1,9 +1,9 @@
-"""Environment self-check (`schematic-netlist doctor`): required/optional dependencies, the
-Tesseract OCR engine, and where the installed code actually lives, with fix instructions."""
+"""Environment self-check (`schematic-netlist doctor`): required/optional dependencies, the OCR
+engine (RapidOCR with its built-in models), and where the installed code actually lives, with fix
+instructions."""
 from __future__ import annotations
 
 import importlib
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,23 +51,27 @@ def _check_module(module: str, package_hint: str, required: bool) -> Check:
         )
 
 
-def _check_tesseract() -> Check:
-    from .image_extract import find_tesseract
-
-    path = find_tesseract()
-    if path is None:
-        return Check(
-            "tesseract (OCR engine)",
-            "warn",
-            "not found (only needed for scanned/image-only PDF pages)",
-            "Install with:  winget install UB-Mannheim.TesseractOCR",
-        )
+def _check_ocr() -> Check:
+    """Load the OCR engine and read one line: proves the models and the ONNX runtime work."""
     try:
-        result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
-        first_line = result.stdout.splitlines()[0] if result.stdout else path
-        return Check("tesseract (OCR engine)", "ok", first_line)
-    except Exception as e:  # pragma: no cover -- defensive, binary found but unrunnable
-        return Check("tesseract (OCR engine)", "warn", f"found at {path} but failed to run: {e}")
+        import numpy as np
+
+        from .image_extract import ocr_engine
+
+        img = np.full((48, 160, 3), 255, np.uint8)
+        import cv2
+
+        cv2.putText(img, "R12", (8, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
+        res = ocr_engine()(img)
+        got = " ".join(res.txts or ())
+        if "R12" not in got:
+            return Check("OCR engine", "warn", f"loaded, but read {got!r} instead of \u0027R12\u0027")
+        return Check("OCR engine", "ok", "RapidOCR, PP-OCRv6 models built in")
+    except ImportError:
+        return Check("OCR engine", "warn", "not installed (only needed for scanned/image-only PDF pages)",
+                     'Install with:  uv pip install -e ".[image]"')
+    except Exception as e:  # pragma: no cover -- defensive, installed but broken
+        return Check("OCR engine", "warn", f"installed but failed to run: {e}")
 
 
 def _check_source_location() -> Check:
@@ -92,9 +96,10 @@ def run_checks() -> list[Check]:
     checks = [_check_python(), _check_module("pdfplumber", "base dependency", required=True)]
     checks.append(_check_module("openpyxl", "base dependency", required=True))
     checks.append(_check_module("cv2", "image extra", required=False))
-    checks.append(_check_module("pytesseract", "image extra", required=False))
+    checks.append(_check_module("rapidocr", "image extra", required=False))
+    checks.append(_check_module("onnxruntime", "image extra", required=False))
     checks.append(_check_module("numpy", "image extra", required=False))
-    checks.append(_check_tesseract())
+    checks.append(_check_ocr())
     checks.append(_check_source_location())
     return checks
 
@@ -110,14 +115,13 @@ def format_report(checks: list[Check]) -> str:
         lines.append("")
         lines.append("Required dependencies are missing -- `analyze` will not work.")
     else:
-        image_ready = all(c.status == "ok" for c in checks if c.name in {"cv2", "pytesseract"} or "tesseract" in c.name)
+        image_ready = all(c.status == "ok" for c in checks if c.name in {"cv2", "rapidocr", "onnxruntime", "numpy", "OCR engine"})
         lines.append("")
         if image_ready:
             lines.append("Everything is ready, including scanned/image-only PDF pages.")
         else:
             lines.append(
                 "Core features are ready. Scanned/image-only PDF pages need the items marked "
-                "[WARN]/[MISS] above -- `uv pip install -e \".[image]\"` and "
-                "`winget install UB-Mannheim.TesseractOCR`."
+                "[WARN]/[MISS] above -- `uv pip install -e \".[image]\"`."
             )
     return "\n".join(lines)

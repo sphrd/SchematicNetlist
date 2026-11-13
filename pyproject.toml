@@ -1,6 +1,6 @@
 [project]
 name = "schematic-netlist"
-version = "0.4.2"
+version = "0.5.0"
 description = "Read a schematic PDF (vector or scanned) into components, nets, an HSPICE netlist and an Excel analysis report."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -20,11 +20,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Reading scanned/image-only PDF pages (OpenCV + OCR). Also needs the Tesseract OCR engine,
-# a separate system install (bundled into the Windows exe by src/build_exe.py).
+# Reading scanned/image-only PDF pages: OpenCV + RapidOCR (PP-OCRv6 models ship inside the package).
 image = [
     "opencv-python-headless>=4.8",
-    "pytesseract>=0.3.10",
+    "rapidocr>=3.10",
+    "onnxruntime>=1.20",
     "numpy>=1.24",
 ]
 # Real OS drag-and-drop in the GUI. Without it the GUI still works via its "Browse..." button.
