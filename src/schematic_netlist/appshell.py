@@ -407,7 +407,8 @@ def draw_splash(name: str, author: str, version: str, description: str, icon: Im
     px = 158 + int(d.textlength(by, font=pil_font(14))) + 12
     pw = int(d.textlength(pill_text, font=pf)) + 18
     d.rounded_rectangle((px, 96, px + pw, 118), radius=11, fill=T["surface"], outline=T["border"])
-    d.text((px + pw / 2, 107), pill_text, font=pf, fill=T["accent"], anchor="mm")
+    # baseline so the capitals/digits sit in the pill's middle ("mm" centres ascender..descender: too low)
+    d.text((px + pw / 2, 107 + round(CAP_HEIGHT * 12 / 2)), pill_text, font=pf, fill=T["accent"], anchor="ms")
     d.rounded_rectangle((158, 130, 202, 134), radius=2, fill=T["accent"])
     d.rectangle((36, 158, width - 36, 159), fill=T["surface"])
     d.text((36, 172), description, font=pil_font(14), fill=T["fg"])
@@ -558,6 +559,20 @@ def splash_preview(modules: list[str]) -> int:
 
 
 # --------------------------------------------------------------------------- UI pieces
+CAP_HEIGHT = 0.70  # Segoe UI capital height in em (1434 / 2048 units)
+
+
+def text_top(widget: tk.Misc, font: tkfont.Font, h: float) -> int:
+    """y of a canvas text item (anchor "n"/"nw") that centres the CAPITALS in a box `h` high.
+
+    Tk's anchor "center" centres the font's line box (ascent + descent). Segoe UI's ascent keeps
+    room above the capitals for accents, so centred text sits visibly low. This centres the
+    capital height instead, which is what the eye reads as the middle of a label."""
+    size = font.actual("size")
+    em = -size if size < 0 else size * widget.winfo_fpixels("1p")
+    return round(h / 2 + CAP_HEIGHT * em / 2 - font.metrics("ascent"))
+
+
 def _logo(info: AppInfo, size: int) -> ImageTk.PhotoImage:
     img = Image.open(info.icon_png).convert("RGBA")
     return ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
@@ -574,6 +589,9 @@ def _dark_title(win: tk.Misc) -> None:
     for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (older builds: 19)
         if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
             break
+    # repaint the frame now (Windows 10 otherwise keeps the light caption until the next activation)
+    swp = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE NOMOVE NOZORDER NOACTIVATE FRAMECHANGED
+    ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, swp)
 
 
 def round_popup(win: tk.Misc) -> None:
@@ -601,6 +619,11 @@ class AppDialog(tk.Toplevel):
 
     def __init__(self, master: tk.Misc, info: AppInfo, ui, title: str) -> None:
         super().__init__(master, bg=ui.BG)
+        # Invisible until fully built: Tk maps a new toplevel at the first idle (here in _place), i.e. with
+        # Windows' light caption and before the dark-mode attribute and the content exist. Alpha 0 hides
+        # that first frame; show() makes the window opaque once it is dark and laid out.
+        self.attributes("-alpha", 0.0)
+        self._shown = False
         self.ui, self.info = ui, info
         self.title(title)
         self.resizable(False, False)
@@ -666,6 +689,11 @@ class AppDialog(tk.Toplevel):
         else:
             self.pill.place(x=140, y=h - 20 - self.buttons.winfo_reqheight() - 18)
             self.set_progress(None, progress)
+        if not self._shown:
+            self._shown = True
+            self.update_idletasks()  # dark caption + content painted while still transparent
+            self.attributes("-alpha", 1.0)
+            self.focus_force()
 
     def set_progress(self, body: Optional[str], fraction: float) -> None:
         if body is not None:
@@ -682,6 +710,16 @@ class AppDialog(tk.Toplevel):
         self._pill_img = ImageTk.PhotoImage(progress_image(self.W - 164, self._fraction, time.monotonic(), self.ui.BG))
         self.pill.configure(image=self._pill_img)
         self._pill_job = self.after(30, self._animate_pill)
+
+
+def message(app: tk.Misc, info: AppInfo, ui, heading: str, body: str, title: Optional[str] = None) -> None:
+    """Modal notice in the app's dialog frame (replaces tkinter.messagebox); Enter or Escape closes."""
+    win = AppDialog(app, info, ui, title or f"{info.name} - {heading}")
+    win.show(heading, body, [("OK", win.destroy)])
+    win.bind("<Return>", lambda _e: win.destroy())
+    with contextlib.suppress(tk.TclError):
+        win.grab_set()
+    app.wait_window(win)
 
 
 class UpdateManager:
@@ -891,7 +929,7 @@ class TitleBar(tk.Frame):
             c.delete("all")
             if hover:
                 ui._paint_round_rect(c, w, h, 8, ui.BORDER, None)
-            c.create_text(w / 2, h / 2, text=text, fill=ui.FG if hover else ui.MUTED, font=f)
+            c.create_text(w / 2, text_top(c, f, h), anchor="n", text=text, fill=ui.FG if hover else ui.MUTED, font=f)
 
         draw(False)
         c.bind("<Enter>", lambda _e: draw(True))

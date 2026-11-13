@@ -365,9 +365,17 @@ def build_circuit(d: Design, source: str = "") -> Circuit:
 
     # ---- warnings
     for pi, pn in enumerate(d.pages):
-        unnamed_flags = sum(1 for t in pn.terminals if t.comp is None and t.label is None)
-        if unnamed_flags:
-            warnings.append(Warning_("warn", pn.page, f"{unnamed_flags} wire end(s) on a symbol that has neither a reference designator nor a net name (dropped)"))
+        loose = [t for t in pn.terminals if t.comp is None and t.label is None]
+        flags = sum(1 for t in loose if t.mark is not None)
+        if flags:
+            warnings.append(Warning_("warn", pn.page, f"{flags} connector flag(s) without a net name: their wires join no other flag or page"))
+        if len(loose) > flags:
+            warnings.append(Warning_("warn", pn.page, f"{len(loose) - flags} wire end(s) on a symbol without a reference designator or net name: not counted as part pins"))
+        for x0, y0, x1, y1, _n, kind in pn.ocr_regions:
+            if kind == "drawing":
+                warnings.append(Warning_("warn", pn.page, f"embedded image at ({x0:.0f},{y0:.0f}) read as a drawing by OCR: its graphics were merged into the netlist, review this page"))
+            elif kind.startswith("not read"):
+                warnings.append(Warning_("warn", pn.page, f"embedded image at ({x0:.0f},{y0:.0f}) {kind}: its content is missing from the netlist"))
     dangling = [n for n in nets.values() if len(n.pins) == 1 and not n.aliases and n.flags == 0]
     for n in dangling:
         r, p, _ = n.pins[0]
@@ -384,7 +392,7 @@ def build_circuit(d: Design, source: str = "") -> Circuit:
         dup = [k for k, v in Counter(p.number for p in part.pins if p.number).items() if v > 1]
         if dup:
             nets_of = {num: {p.net for p in part.pins if p.number == num} for num in dup}
-            clash = {k: v for k, v in nets_of.items() if len(v) > 1}
+            clash = {k: sorted(v) for k, v in nets_of.items() if len(v) > 1}
             if clash:
                 warnings.append(Warning_("warn", part.pages[0], f"{part.refdes}: pin(s) {sorted(clash)} appear on different nets: {clash}"))
         if part.kind in TWO_PIN_KINDS and part.pin_count != 2 and not (part.kind == "relay coil" and part.is_box):
@@ -418,5 +426,12 @@ def build_circuit(d: Design, source: str = "") -> Circuit:
     log.insert(1, f"{len(circuit.parts)} parts: " + ", ".join(f"{k} {v}" for k, v in kinds.most_common()))
     log.insert(2, f"{len(circuit.nets)} nets with pins, {len(circuit.rails)} power/ground rails: "
                   + ", ".join(n.name for n in circuit.rails[:12]))
+    # extraction notes (page readers, scale sample, survey) and every embedded image read by OCR
+    regions = [
+        f"page {pn.page}: embedded image {x1 - x0:.0f}x{y1 - y0:.0f} pt at ({x0:.0f},{y0:.0f}) read by OCR ({kind}): {n} word(s)"
+        for pn in d.pages
+        for x0, y0, x1, y1, n, kind in pn.ocr_regions
+    ]
+    log[3:3] = list(d.notes) + regions
     log.append(f"{sum(1 for w in warnings if w.level == 'warn')} warning(s), {sum(1 for w in warnings if w.level == 'info')} note(s)")
     return circuit

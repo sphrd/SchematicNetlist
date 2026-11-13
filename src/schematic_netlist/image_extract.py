@@ -40,6 +40,19 @@ DASH_MAX_THICK_PT = 1.2  # ... and the line at most this thick
 FRAGMENT_MAX_PT = 3.0  # longest run that can be a staircase step of a diagonal stroke
 COMPACT_MAX_PT = 12.0  # isolated ink no larger than this (a relay's contact group) ...
 COMPACT_MIN_PT = 1.2  # ... and at least this wide both ways (not a straight stub) is a symbol shape
+REGION_MIN_W_PT = 24.0  # smallest embedded image (drawn size) that can hold readable text
+REGION_MIN_H_PT = 12.0
+REGION_MIN_COVER = 0.03  # ... and it must cover at least this share of the page
+LOGO_MIN_PAGES = 3  # an image with the same pixel size on this many pages is a logo/stamp, never OCR'd
+# region class (_region_kind): measured on the image's own pixels, never on its drawn size
+REGION_CLASS_DPI = 150  # an embedded image is measured as a scan of this density (1 image pixel = 0.48 pt)
+REGION_CLASS_MAX_PX = 12_000_000  # bigger images are measured downsampled (bound by pixel count)
+REGION_DRAWING_MIN_DOTS = 3  # filled junction dots that a drawing needs (tables/text have none)
+REGION_DRAWING_MAX_DOTS_PER_WIRE = 0.33  # schematics 0.07-0.27; pads/glyph residue of tables, pinouts: 0.4-5
+REGION_DRAWING_MIN_LONG_SHARE = 0.05  # share of wires >= REGION_LONG_WIRE_PT: schematics >= 0.09, ball maps 0.02
+REGION_LONG_WIRE_PT = 10.0
+REGION_RULED_MAX = 0.5  # share of line length in lines spanning half the picture: tables ~1, schematics <= 0.47
+REGION_TABLE_BOX_COVER = 0.3  # boxes (below half the picture: no frame) covering this much = cells/legend, not a drawing
 
 
 def _require_image_deps() -> None:
@@ -477,23 +490,31 @@ def _drop_diagonal_fragments(ink, runs: list, horizontal: bool, scale: float) ->
 
 def raster_primitives(page, resolution: int | None = None) -> Primitives:
     _require_image_deps()
-    import cv2
     import numpy as np
 
     resolution = resolution or native_resolution(page)
     scale = resolution / 72.0
     gray = np.array(page.to_image(resolution=resolution).original.convert("L"))
+    words = _text_layer_words(page) or _ocr_words(gray, scale)
+    return _primitives_from_gray(gray, scale, words, has_text_layer=bool(page.chars))
+
+
+def _primitives_from_gray(gray, scale: float, words: list[Word], has_text_layer: bool) -> Primitives:
+    """Primitives of one rendered image (a scanned page or an embedded picture region)."""
+    import cv2
+    import numpy as np
+
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     # text must not become wires or symbols; long strokes (wires running under a label) stay
-    words = _text_layer_words(page) or _ocr_words(gray, scale)
+    words = list(words)
     kl = max(3, int(OCR_ERASE_PT * scale))
     long_strokes = cv2.bitwise_or(
         cv2.morphologyEx(ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (kl, 1))),
         cv2.morphologyEx(ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, kl))),
     )
     text, unread = _text_components(cv2.bitwise_and(ink, cv2.bitwise_not(long_strokes)), words, scale)
-    if unread and not page.chars:
+    if unread and not has_text_layer:
         words += _ocr_rows(gray, unread, scale)
     ink = cv2.bitwise_and(ink, cv2.bitwise_not(text))
     ink = _erase_dashed(ink, scale)
@@ -556,5 +577,123 @@ def raster_primitives(page, resolution: int | None = None) -> Primitives:
         if not any(_on_outline(seg, b) for b in boxes):
             orth.append(seg)
     return Primitives(
-        orth, [], curves, boxes, dots, words, tol=RASTER_TOL, colinear_tol=0.6, source="raster", dotless_t_min=DOTLESS_T_MIN_PT
+        orth, [], curves, boxes, dots, words, tol=RASTER_TOL, colinear_tol=0.6, source="raster", dotless_t_min=DOTLESS_T_MIN_PT,
+        drawn_dots=len(dot_ids),
     )
+
+
+# --------------------------------------------------------------------------- embedded image regions
+def image_regions(page, logo_sizes: frozenset = frozenset()) -> list[tuple[float, float, float, float]]:
+    """Embedded raster regions of a vector page big enough to hold readable content: pictures of
+    tables (tester-configuration sheets) or drawings pasted into the schematic. Repeated logos
+    (same pixel size on several pages: ``logo_sizes``) and tiny stamps are skipped; the same
+    image drawn several times at one spot counts once."""
+    pw, ph = float(page.width), float(page.height)
+    seen: set = set()
+    out: list[tuple[float, float, float, float]] = []
+    for im in page.images:
+        x0, top = max(0.0, float(im["x0"])), max(0.0, float(im["top"]))
+        x1, bottom = min(pw, float(im["x1"])), min(ph, float(im["bottom"]))
+        w, h = x1 - x0, bottom - top
+        if tuple(im.get("srcsize") or ()) in logo_sizes:
+            continue
+        if w < REGION_MIN_W_PT or h < REGION_MIN_H_PT or w * h < REGION_MIN_COVER * pw * ph:
+            continue
+        key = (round(x0, 1), round(top, 1), round(x1, 1), round(bottom, 1))
+        if key not in seen:
+            seen.add(key)
+            out.append((x0, top, x1, bottom))
+    return out
+
+
+def _region_native_dpi(page, bbox: tuple[float, float, float, float]) -> float | None:
+    """Pixel density of the largest embedded image inside ``bbox`` as drawn (image pixels per
+    inch of page); None when no image there reports its pixel size."""
+    x0, top, x1, bottom = bbox
+    best = None
+    for im in page.images:
+        w_pt = float(im["x1"]) - float(im["x0"])
+        src = im.get("srcsize")
+        inside = float(im["x0"]) >= x0 - 1 and float(im["x1"]) <= x1 + 1 and float(im["top"]) >= top - 1 and float(im["bottom"]) <= bottom + 1
+        if inside and src and w_pt > 0 and (best is None or w_pt > best[0]):
+            best = (w_pt, src[0] / (w_pt / 72.0))
+    return best[1] if best else None
+
+
+def _region_dpi(page, bbox: tuple[float, float, float, float], default: int = 300) -> int:
+    """Render density for OCR of one region: its native pixel density (same rule as
+    native_resolution, but per region), clamped to 150-600."""
+    native = _region_native_dpi(page, bbox)
+    dpi = int(round(native)) if native else default
+    return max(150, min(dpi, 600))
+
+
+def _region_kind(page, bbox: tuple[float, float, float, float], words: list[Word]) -> str:
+    """Class of one embedded image -- "drawing" | "table" | "text" -- decided on the image's OWN
+    pixels so a picture gets the same class whatever size it is drawn at: rendered at its native
+    density (one image pixel = one pixel), measured as a REGION_CLASS_DPI scan, text erased
+    (``words``: its OCR words in region pt). A drawing (a pasted schematic) has filled junction
+    dots, few of them per wire, a share of long wires, and is neither ruled (lines spanning the
+    picture: a table) nor covered by boxes (cells, legend swatches); everything else with lines
+    is a table."""
+    import math
+
+    import numpy as np
+
+    native = _region_native_dpi(page, bbox) or float(REGION_CLASS_DPI)
+    x0, top, x1, bottom = bbox
+    px = (x1 - x0) * (bottom - top) * (native / 72.0) ** 2
+    if px > REGION_CLASS_MAX_PX:  # bounded by the image's pixel count, not by its drawn size
+        native *= math.sqrt(REGION_CLASS_MAX_PX / px)
+    sc = REGION_CLASS_DPI / 72.0
+    k = native / 72.0 / sc  # region pt -> measurement units
+    gray = np.array(page.crop(bbox).to_image(resolution=native).original.convert("L"))
+    mapped = [Word(w.text, w.x0 * k, w.top * k, w.x1 * k, w.bottom * k) for w in words]
+    p = _primitives_from_gray(gray, sc, mapped, has_text_layer=True)
+    if len(p.orth) + len(p.boxes) < 6:
+        return "text"
+    W, H = gray.shape[1] / sc, gray.shape[0] / sc
+    lens = [(s[2] - s[0], s[3] - s[1]) for s in p.orth]
+    total = sum(max(d) for d in lens) or 1.0
+    ruled = sum(dx for dx, dy in lens if dx >= dy and dx >= 0.5 * W) + sum(dy for dx, dy in lens if dy > dx and dy >= 0.5 * H)
+    long_share = sum(1 for d in lens if max(d) >= REGION_LONG_WIRE_PT) / max(1, len(lens))
+    cover = sum((b[2] - b[0]) * (b[3] - b[1]) for b in p.boxes if (b[2] - b[0]) * (b[3] - b[1]) < 0.5 * W * H) / (W * H)
+    dots = p.drawn_dots
+    if (
+        dots >= REGION_DRAWING_MIN_DOTS
+        and dots <= REGION_DRAWING_MAX_DOTS_PER_WIRE * len(lens)
+        and long_share >= REGION_DRAWING_MIN_LONG_SHARE
+        and ruled / total < REGION_RULED_MAX
+        and cover < REGION_TABLE_BOX_COVER
+    ):
+        return "drawing"
+    return "table"
+
+
+def scan_image_region(page, bbox: tuple[float, float, float, float]):
+    """OCR one embedded image region of a vector page. Returns (words, kind, prims): the words in
+    page coordinates, kind "drawing" | "table" | "text" (_region_kind), and for drawings (a pasted
+    schematic scan) the region's raster primitives shifted into page coordinates so its graphics
+    are not lost; None otherwise."""
+    _require_image_deps()
+    import numpy as np
+
+    x0, top, x1, bottom = bbox
+    dpi = _region_dpi(page, bbox)
+    scale = dpi / 72.0
+    gray = np.array(page.crop(bbox).to_image(resolution=dpi).original.convert("L"))
+    local = _ocr_words(gray, scale)
+    words = [Word(w.text, w.x0 + x0, w.top + top, w.x1 + x0, w.bottom + top) for w in local]
+    kind = _region_kind(page, bbox, local)
+    if kind != "drawing":
+        return words, kind, None
+    prims = _primitives_from_gray(gray, scale, [], has_text_layer=True)
+    _shift_primitives(prims, x0, top)
+    return words, "drawing", prims
+
+
+def _shift_primitives(prims: Primitives, dx: float, dy: float) -> None:
+    """Move region-local primitives into page coordinates."""
+    for name in ("orth", "diag", "curves", "boxes", "tris", "strokes", "bars", "rings"):
+        setattr(prims, name, [(x0 + dx, y0 + dy, x1 + dx, y1 + dy) for x0, y0, x1, y1 in getattr(prims, name)])
+    prims.dots = [(x + dx, y + dy, r) for x, y, r in prims.dots]
