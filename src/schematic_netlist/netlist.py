@@ -62,11 +62,13 @@ REFDES_RE = re.compile(r"^[A-Z]{1,3}\d{1,4}[A-Z]?(?:[_-]\d{1,3}[A-Z]?)?$")
 REFDES_LONG_RE = re.compile(r"^[A-Z]{1,3}\d{1,4}[A-Z]{2,4}$")
 # designator spelled in mixed case (Rload1, Vin1): a capital, a short word, a number
 REFDES_MIXED_RE = re.compile(r"^[A-Z](?=[A-Za-z]*[a-z])[A-Za-z]{1,6}\d{1,3}$")
-# free-form designators (R_SHUNT_1, SOCKET2, TP_A_1): letters, digits and underscores with at
-# least one digit; accepted only in the document's refdes colour
-REFDES_LOOSE_RE = re.compile(r"^(?=.*\d)[A-Z](?:[A-Z0-9]{0,7}(?:_[A-Z0-9]{1,6}){0,2}|[A-Z0-9]{8,11}(?:_[A-Z0-9]{1,6}){1,2})$")
+# free-form designators (R_SHUNT_1, SOCKET2, TP_A_1, SENSE_P_TP_1): letters, digits and underscores
+# with at least one digit; accepted only in the document's refdes colour
+REFDES_LOOSE_RE = re.compile(r"^(?=.*\d)[A-Z](?:[A-Z0-9]{0,7}(?:_[A-Z0-9]{1,6}){0,3}|[A-Z0-9]{8,11}(?:_[A-Z0-9]{1,6}){1,2})$")
 # designator of a part not yet annotated (R?, C?, U?): a part all the same, named per page
 PLACEHOLDER_RE = re.compile(r"^[A-Z]{1,3}\?$")
+# a test point named after its signal (UDC_TP, SENSE_P_TP_1): a TP word in a free-form name
+TESTPOINT_RE = re.compile(r"^(?=(?:.*_)?TP\d*(?:_|$))[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){0,3}$")
 # refdes with an instance suffix (K5_2A: part K5, instance 2, unit A) -- multi-channel/multi-copy designs
 SUFFIXED_REFDES_RE = re.compile(r"^[A-Z]{1,3}\d{1,4}[A-Z]?_\d{1,3}[A-Z]?$")
 PINNUM_RE = re.compile(r"^(?:[A-Z]{0,2}\d{1,3}[A-Z]?|[A-Z]{1,2})$")
@@ -85,6 +87,8 @@ def _refdes_like(w: "Word", refdes_color: tuple) -> bool:
     if REFDES_RE.match(w.text):
         return True
     if not refdes_color and REFDES_MIXED_RE.match(w.text):
+        return True
+    if TESTPOINT_RE.match(w.text) and (not refdes_color or w.color == refdes_color):
         return True
     if not refdes_color or w.color != refdes_color:
         return False
@@ -266,6 +270,8 @@ class PageNetlist:
     refdes_color: tuple = ()  # colour the refdes words were recognised by (empty: none available)
     scale: float = 1.0  # drawing text height / TEXT_UNIT (multiplies every geometric tolerance)
     text_size: Optional[float] = None  # measured legible text height (pt); None: no text layer
+    # embedded images read by OCR: (x0, top, x1, bottom, words added, kind)
+    ocr_regions: list[tuple[float, float, float, float, int, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +295,9 @@ class Primitives:
     strokes: list[tuple[float, float, float, float]] = field(default_factory=list)  # orthogonal lines of symbol graphics
     bars: list[tuple[float, float, float, float]] = field(default_factory=list)  # thick strokes drawn as slim rectangles
     rings: list[tuple[float, float, float, float]] = field(default_factory=list)  # closed round outlines (bbox)
+    # embedded images read by OCR: (x0, top, x1, bottom, words added, kind)
+    ocr_regions: list[tuple[float, float, float, float, int, str]] = field(default_factory=list)
+    drawn_dots: int = 0  # raster: the first drawn_dots of ``dots`` are filled dots seen in the ink (the rest: snapped wire joints)
 
 
 # --------------------------------------------------------------------------- page extraction
@@ -317,8 +326,9 @@ def page_text_size(page, frac: float = TEXT_MIN) -> Optional[float]:
     return legible[len(legible) // 2]
 
 
-def _scale_sample(idxs: list[int], sample: int = 16) -> list[int]:
-    """The pages document_scale measures: an even sample of at most ``sample`` pages."""
+def _scale_sample(idxs: list[int], sample: int = 8) -> list[int]:
+    """The pages document_scale measures: an even sample of at most ``sample`` pages (8 keeps the
+    document median stable at half the duplicate-parse cost of the earlier 16)."""
     return idxs[:: max(1, -(-len(idxs) // sample))]
 
 
@@ -340,9 +350,11 @@ def _scale_of(sizes: Iterable[Optional[float]]) -> Optional[float]:
     return s[(len(s) - 1) // 2] / TEXT_UNIT if s else None
 
 
-def document_scale(pdf_path: str, pages: Optional[list[int]] = None, sample: int = 16) -> Optional[float]:
+def document_scale(pdf_path: str, pages: Optional[list[int]] = None, sample: int = 8) -> Optional[float]:
     """The document's drawing scale: the lower median of the legible text height of (a sample of)
-    its pages, / TEXT_UNIT. None when the document has (almost) no text layer."""
+    its pages, / TEXT_UNIT. None when the document has (almost) no text layer. Measured with
+    pdfplumber text sizes: pdfium char-box heights were tried as a faster source and rejected --
+    their ratio to the text size drifts 0.56-0.84 with the font, page by page on one document."""
     import pdfplumber
 
     if not pages:
@@ -551,8 +563,10 @@ def vector_primitives(page, scale: Optional[float] = None) -> Primitives:
     return Primitives(orth, diag, curves, boxes, dots, words, tol=TOL * scale, colinear_tol=0.05 * scale, scale=scale, tris=tris, text_size=ts, strokes=strokes, bars=bars, rings=rings)
 
 
-def page_primitives(page, scale: Optional[float] = None) -> Primitives:
-    """Drawing primitives of one page; pages without vector drawing go through the raster/OCR front-end."""
+def page_primitives(page, scale: Optional[float] = None, logo_sizes: frozenset = frozenset()) -> Primitives:
+    """Drawing primitives of one page; pages without vector drawing go through the raster/OCR
+    front-end, large embedded images on vector pages are read by OCR per region (``logo_sizes``:
+    image pixel sizes repeated across pages -- logos/stamps, skipped)."""
     from . import image_extract
 
     if image_extract.page_is_raster(page):
@@ -561,12 +575,28 @@ def page_primitives(page, scale: Optional[float] = None) -> Primitives:
     if image_extract.text_is_outlined(page, prims.words):
         prims.words = image_extract.ocr_page_words(page)
         prims.source = "vector+ocr"
+    for bbox in image_extract.image_regions(page, logo_sizes):
+        try:
+            words, kind, rp = image_extract.scan_image_region(page, bbox)
+        except Exception as e:  # OCR missing/failed: record the region, never skip it silently
+            prims.ocr_regions.append((*bbox, 0, f"not read ({e})"[:120]))
+            continue
+        new = [
+            w
+            for w in words
+            if not any(w.x0 < v.x1 and v.x0 < w.x1 and w.top < v.bottom and v.top < w.bottom for v in prims.words)
+        ]
+        prims.words.extend(new)
+        if rp is not None:  # a pasted drawing: keep its graphics, not only its words
+            for name in ("orth", "diag", "curves", "boxes", "tris", "strokes", "bars", "rings", "dots"):
+                getattr(prims, name).extend(getattr(rp, name))
+        prims.ocr_regions.append((*bbox, len(new), kind))
     return prims
 
 
-def extract_page(page, pno: int, refdes_color_hint: tuple = (), scale: Optional[float] = None) -> PageNetlist:
+def extract_page(page, pno: int, refdes_color_hint: tuple = (), scale: Optional[float] = None, logo_sizes: frozenset = frozenset()) -> PageNetlist:
     """Netlist of one page; pages without vector drawing go through the raster/OCR front-end."""
-    return build_page(page_primitives(page, scale), pno, float(page.width), float(page.height), refdes_color_hint)
+    return build_page(page_primitives(page, scale, logo_sizes), pno, float(page.width), float(page.height), refdes_color_hint)
 
 
 def _dedupe(items: list, key=lambda v: tuple(round(x, 2) for x in v)) -> list:
@@ -583,11 +613,23 @@ def _dedupe(items: list, key=lambda v: tuple(round(x, 2) for x in v)) -> list:
 
 def _dashes(orth: list, tol: float, dash_max: float) -> set[int]:
     """Segments of a dashed line drawn stroke by stroke: three or more short colinear pieces of about
-    one length, one gap apart. Wires are never dashed (a mechanical link, a grouping frame)."""
+    one length, one gap apart. Wires are never dashed (a mechanical link, a grouping frame).
+    A dash stands free: a short edge whose ends meet crossing lines (the back of a column of
+    stacked flag outlines) is not one."""
+    corners: dict[tuple, set[bool]] = defaultdict(set)
+    for x0, y0, x1, y1 in orth:
+        h = y1 - y0 <= x1 - x0
+        for px, py in ((x0, y0), (x1, y1)):
+            corners[(round(px / tol), round(py / tol))].add(h)
+
+    def joined(px: float, py: float, h: bool) -> bool:
+        cx, cy = round(px / tol), round(py / tol)
+        return any((not h) in corners.get((cx + a, cy + b), ()) for a in (-1, 0, 1) for b in (-1, 0, 1))
+
     rows: dict[tuple, list[int]] = defaultdict(list)
     for i, (x0, y0, x1, y1) in enumerate(orth):
         h = y1 - y0 <= x1 - x0
-        if max(x1 - x0, y1 - y0) <= dash_max:
+        if max(x1 - x0, y1 - y0) <= dash_max and not (joined(x0, y0, h) and joined(x1, y1, h)):
             rows[(h, round((y0 if h else x0) / tol))].append(i)
     out: set[int] = set()
     for (h, _), idx in rows.items():
@@ -1957,6 +1999,14 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
                     if t.cluster == r2:
                         t.cluster = r
 
+    # a wire end on nothing but long plain rules that no designator or label claims is a line of a
+    # table or title block (its dividers end on the rules without junction dots), not a pin
+    def ruled(r: int) -> bool:
+        el = cl_elems.get(r, [])
+        return bool(el) and all(kind == "O" and max(b[2] - b[0], b[3] - b[1]) > internal_max for kind, b in el)
+
+    terminals = [t for t in terminals if t.label is not None or t.cluster in cl_refdes or not ruled(t.cluster)]
+
     # components
     # a cluster holding the designators of separate parts (test points drawn touching), one per pin
     # and all pins entering from one side, is that many one-pin parts: each pin goes to its nearest designator
@@ -2077,7 +2127,10 @@ def build_page(prims: Primitives, pno: int, pw: float, ph: float, refdes_color_h
             labels.append((w.text, uf.find(j), w))
 
     seg_net = [uf.find(i) for i in range(n)]
-    return PageNetlist(pno, pw, ph, orth, seg_net, terminals, comps, labels, words, prims.source, refdes_color, S, prims.text_size)
+    return PageNetlist(
+        pno, pw, ph, orth, seg_net, terminals, comps, labels, words, prims.source, refdes_color, S, prims.text_size,
+        ocr_regions=list(getattr(prims, "ocr_regions", ())),
+    )
 
 
 def _match(pairs: list[tuple[float, int, int]], miss: float) -> dict[int, tuple[float, int]]:
@@ -2243,6 +2296,7 @@ class Design:
     net_terms: dict[tuple, list[tuple[int, int]]]  # gnet -> [(page_idx, terminal_idx)]
     scale: float = 1.0  # document text height / TEXT_UNIT (document_scale)
     raw_scale: Optional[float] = None  # measured document scale (None: too little text to measure)
+    notes: list[str] = field(default_factory=list)  # extraction notes (workers, scale sample, survey)
 
     def gnet(self, page_idx: int, local_net: int) -> tuple:
         return self.net_uf.find((page_idx, local_net))
@@ -2370,7 +2424,9 @@ class ExtractionCancelled(Exception):
     """Raised by extract_design when its cancel_check returns True."""
 
 
-def _extract_pages(pdf_path: str, pnos: list[int], hint: tuple, scale: Optional[float]) -> list[tuple[PageNetlist, Optional[bytes]]]:
+def _extract_pages(
+    pdf_path: str, pnos: list[int], hint: tuple, scale: Optional[float], logo_sizes: frozenset = frozenset()
+) -> list[tuple[PageNetlist, Optional[bytes]]]:
     """Worker: netlists of some pages of one PDF (each process opens the file itself), each with
     its drawing primitives pickled so the page can be rebuilt with the document's refdes colour
     without parsing (or OCR-ing) it again; None for scanned pages, which are never rebuilt."""
@@ -2380,7 +2436,7 @@ def _extract_pages(pdf_path: str, pnos: list[int], hint: tuple, scale: Optional[
     with pdfplumber.open(pdf_path) as pdf:
         for pno in pnos:
             page = pdf.pages[pno - 1]
-            prims = page_primitives(page, scale)
+            prims = page_primitives(page, scale, logo_sizes)
             # (build_page changes the primitives it is given: pickle them first)
             blob = None if prims.source == "raster" else pickle.dumps(prims, protocol=pickle.HIGHEST_PROTOCOL)
             out.append((build_page(prims, pno, float(page.width), float(page.height), hint), blob))
@@ -2467,6 +2523,41 @@ def _stop_pool(pool) -> None:
         p.terminate()
 
 
+def _pdfium_survey(pdf_path: str, idxs: list[int]) -> tuple[dict[int, int], frozenset]:
+    """One fast pdfium pass over the document: a parse-cost weight per page (object count, plus
+    the pixels of embedded images big enough to be OCR'd -- heavy pages are submitted to the pool
+    first so no worker ends up alone with the biggest page), and the pixel sizes of images that
+    repeat across pages (logos/stamps, never OCR'd)."""
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_c
+
+    from . import image_extract
+
+    weights: dict[int, int] = {}
+    imgs: dict[int, list[tuple[int, int]]] = {}
+    size_pages: dict[tuple[int, int], set[int]] = defaultdict(set)
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        for pno in idxs:
+            page = doc[pno - 1]
+            weights[pno] = pdfium_c.FPDFPage_CountObjects(page)
+            sizes = []
+            for obj in page.get_objects(max_depth=4):
+                if obj.type == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+                    md = pdfium_c.FPDF_IMAGEOBJ_METADATA()
+                    if pdfium_c.FPDFImageObj_GetImageMetadata(obj, page, md):
+                        sizes.append((md.width, md.height))
+                        size_pages[(md.width, md.height)].add(pno)
+            imgs[pno] = sizes
+    finally:
+        doc.close()
+    logos = frozenset(s for s, ps in size_pages.items() if len(ps) >= image_extract.LOGO_MIN_PAGES)
+    for pno, sizes in imgs.items():
+        # an image that will be OCR'd costs like a very object-heavy page: weight it by its pixels
+        weights[pno] += sum(w * h // 20 for w, h in sizes if (w, h) not in logos and w >= 200 and h >= 100)
+    return weights, logos
+
+
 def extract_design(
     pdf_path: str,
     pages: Optional[Iterable[int]] = None,
@@ -2482,8 +2573,24 @@ def extract_design(
     with pdfplumber.open(pdf_path) as pdf:
         idxs = pages or list(range(1, len(pdf.pages) + 1))
     total = len(idxs)
+    notes: list[str] = []
     if workers is None:
         workers = default_workers(total)
+        free = _available_memory_mb()
+        notes.append(
+            f"extraction: {workers} parallel page reader(s) for {total} page(s) "
+            f"(physical cores {max(1, (os.cpu_count() or 2) // 2)}"
+            + (f", free memory {free} MB at {WORKER_MB} MB per reader" if free is not None else "")
+            + ")"
+        )
+    else:
+        notes.append(f"extraction: {workers} page reader(s) (requested) for {total} page(s)")
+    try:
+        weights, logos = _pdfium_survey(pdf_path, idxs)
+        order = sorted(idxs, key=lambda p: -weights.get(p, 0))
+    except Exception as e:  # pdfium missing/failed: read in page order, screen no logos
+        logos, order = frozenset(), list(idxs)
+        notes.append(f"pdfium page survey failed ({e}): pages read in order, embedded images not pre-screened")
 
     def cancelled() -> None:
         if cancel_check is not None and cancel_check():
@@ -2493,9 +2600,9 @@ def extract_design(
     blobs: dict[int, bytes] = {}  # page -> pickled primitives, to rebuild it without parsing it again
     if workers <= 1:
         scale = document_scale(pdf_path, idxs)
-        for n, pno in enumerate(idxs, start=1):
+        for n, pno in enumerate(order, start=1):
             cancelled()
-            pn, blob = _extract_pages(pdf_path, [pno], (), scale)[0]
+            pn, blob = _extract_pages(pdf_path, [pno], (), scale, logos)[0]
             done[pno] = pn
             if blob is not None:
                 blobs[pno] = blob
@@ -2519,10 +2626,11 @@ def extract_design(
 
         pool = ProcessPoolExecutor(max_workers=workers)
         try:
-            # one page per task: the pages are balanced over the workers, progress moves page by
-            # page and a cancel is seen at once (opening the PDF again per task costs next to nothing)
+            # one page per task, heaviest first: the pages are balanced over the workers, the big
+            # pages do not pile up at the tail, progress moves page by page and a cancel is seen
+            # at once (opening the PDF again per task costs next to nothing)
             scale = _scale_of(s for r in results([pool.submit(_page_text_sizes, pdf_path, [p]) for p in _scale_sample(idxs)]) for s in r)
-            for res in results([pool.submit(_extract_pages, pdf_path, [p], (), scale) for p in idxs]):
+            for res in results([pool.submit(_extract_pages, pdf_path, [p], (), scale, logos) for p in order]):
                 for pn, blob in res:
                     done[pn.page] = pn
                     if blob is not None:
@@ -2542,4 +2650,11 @@ def extract_design(
     design = build_design([done[p] for p in idxs])
     design.scale = scale or 1.0
     design.raw_scale = scale
+    sample = _scale_sample(idxs)
+    notes.append(
+        f"drawing scale measured on {len(sample)} sample page(s) (document-wide median text height)"
+        if scale is not None
+        else "drawing scale: the sample pages had too little text to measure"
+    )
+    design.notes = notes
     return design

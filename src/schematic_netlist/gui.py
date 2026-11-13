@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 from tkinter import font as tkfont
 
 import pdfplumber
@@ -197,7 +197,8 @@ class _RoundButton(tk.Canvas):
         _paint_round_rect(self, w, h, 8, fill, None)
         self.delete("label")
         self.create_text(
-            w / 2, h / 2, text=self._text, fill=self._fg if enabled else DISABLED_FG, font=self._font, tags="label"
+            w / 2, appshell.text_top(self, self._font, h), anchor="n", text=self._text,
+            fill=self._fg if enabled else DISABLED_FG, font=self._font, tags="label",
         )
 
 
@@ -231,7 +232,15 @@ def _boxed(parent: tk.Misc, widget_cls, **kw) -> tuple[_RoundedBox, tk.Widget]:
     widget.pack(side="left", fill="x", expand=True)
     widget.bind("<FocusIn>", lambda _e: box.set_outline(ACCENT), add="+")
     widget.bind("<FocusOut>", lambda _e: box.set_outline(BORDER), add="+")
+    if widget_cls is tk.Entry:
+        widget.bind("<Return>", lambda _e: widget.winfo_toplevel().focus_set(), add="+")  # Enter ends editing
     return box, widget
+
+
+def _notify(heading: str, body: str) -> None:
+    """Themed modal notice in the app's dialog frame."""
+    app = tk._default_root
+    appshell.message(app, APP_INFO, sys.modules[__name__], heading, body)
 
 
 def _folder_writable(folder: Path) -> bool:
@@ -244,7 +253,7 @@ def _folder_writable(folder: Path) -> bool:
 
 
 def _warn_read_only(path: Path) -> None:
-    messagebox.showwarning(
+    _notify(
         "Read-only folder",
         f"This file is in a folder that can't be written to:\n\n{path.parent}\n\n"
         "The results are saved next to the file, so move it to a folder you can write to "
@@ -458,7 +467,7 @@ class App(_BaseTk):
         paths = self.tk.splitlist(event.data)
         pdfs = [p for p in paths if p.lower().endswith(".pdf")]
         if not pdfs:
-            messagebox.showwarning("Not a PDF", "Please drop a .pdf file.")
+            _notify("Not a PDF", "Please drop a .pdf file.")
             return
         self._set_pdf(Path(pdfs[0]))
 
@@ -500,19 +509,19 @@ class App(_BaseTk):
 
     def _on_run(self) -> None:
         if self.pdf_path is None:
-            messagebox.showwarning("No PDF", "Choose or drop a schematic PDF first.")
+            _notify("No PDF", "Choose or drop a schematic PDF first.")
             return
         name = self.name_var.get().strip()
         if not name:
-            messagebox.showwarning("Missing name", "Enter a project name first.")
+            _notify("Missing name", "Enter a project name first.")
             return
         bad = bad_file_name(name)
         if bad:
-            messagebox.showwarning("Invalid name", f"The project name names the output folder and files: {bad}")
+            _notify("Invalid name", f"The project name names the output folder and files: {bad}")
             return
         outputs = [k for k in OUTPUTS if self.output_vars[k].get()]
         if not outputs:
-            messagebox.showwarning("No outputs", "Tick at least one output.")
+            _notify("No outputs", "Tick at least one output.")
             return
 
         self._out_dir = self.pdf_path.parent / name
@@ -569,7 +578,7 @@ class App(_BaseTk):
                     self._append_log("\nWrote: " + ", ".join(f.name for f in payload.files))
                     self._reset_buttons()
                     self.open_folder_button.config(state="normal")
-                    messagebox.showinfo(
+                    _notify(
                         "Done",
                         f"{len(c.parts)} parts and {len(c.nets)} nets found on {len(c.pages)} page(s).\n\n"
                         + "\n".join(f.name for f in payload.files),
@@ -580,7 +589,7 @@ class App(_BaseTk):
                 elif kind == "error":
                     self._append_log(f"\nERROR: {payload}")
                     self._reset_buttons()
-                    messagebox.showerror("Failed", str(payload).splitlines()[0])
+                    _notify("Failed", str(payload).splitlines()[0])
         except queue.Empty:
             pass
         self.after(100, self._drain_queue)

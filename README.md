@@ -60,7 +60,10 @@ The engine works on the **vector drawing** of the PDF, the way every ECAD tool e
   (named by its title, else `BOX<page>.<n>`); placeholder designators of an unannotated draft
   (`R?`, `U?`) make parts too, named `R?<page>.<n>`;
 * **scanned / image-only pages** are read with OpenCV + Tesseract OCR into the same model
-  (less reliable — the log lists those pages).
+  (less reliable — the log lists those pages); on vector pages, embedded pictures big enough to
+  hold text (a pasted table or drawing) are OCR'd region by region — logos repeated on several
+  pages are skipped — and every region read is listed in the log (a pasted drawing's graphics
+  join the netlist and raise a review warning; a region OCR could not read is a warning too).
 
 On top of that, `circuit.py` adds the circuit meaning:
 
@@ -116,7 +119,8 @@ schematic-netlist-gui
 ```
 
 Pages are read in parallel processes (one per physical core, max 8, fewer when free memory is
-short). Every run reads the PDF afresh; nothing is cached (the cache folder of earlier versions,
+short; the log states the count and why), heaviest pages first so no reader is left alone with
+the biggest page at the end. Every run reads the PDF afresh; nothing is cached (the cache folder of earlier versions,
 `%LOCALAPPDATA%\SchematicNetlist\cache`, is deleted on the first run).
 
 Build the exe (bundles Tesseract, ~110 MB): `.\build.ps1` (first time `.\build.ps1 -Setup` creates `.venv`) -> `.\SchematicNetlist.exe`.
