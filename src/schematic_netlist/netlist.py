@@ -272,6 +272,9 @@ class PageNetlist:
     text_size: Optional[float] = None  # measured legible text height (pt); None: no text layer
     # embedded images read by OCR: (x0, top, x1, bottom, words added, kind)
     ocr_regions: list[tuple[float, float, float, float, int, str]] = field(default_factory=list)
+    # connections the PDF states outside the drawing (page links): nets sharing a key are one net,
+    # without the key becoming a net name
+    joins: list[tuple[str, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -2453,6 +2456,13 @@ def build_design(pages: list[PageNetlist]) -> Design:
                 uf.union(first_by_label[key], node)
             else:
                 first_by_label[key] = node
+    first_by_join: dict[str, tuple] = {}
+    for pi, pn in enumerate(pages):
+        for key, net in pn.joins:
+            if key in first_by_join:
+                uf.union(first_by_join[key], (pi, net))
+            else:
+                first_by_join[key] = (pi, net)
     # unnamed connector flags: a flag drawn exactly like flags that all carry one name is on that
     # net (a ground symbol with its name hidden); identical unnamed flags of one page share a net.
     # Never at the price of joining two differently named nets (a marker such as a power flag
@@ -2506,19 +2516,47 @@ class ExtractionCancelled(Exception):
     """Raised by extract_design when its cancel_check returns True."""
 
 
-# --------------------------------------------------------------------------- CAD netlist inside the PDF
-CAD_PIN_TOL = 1.0  # a drawn pin end this close to a pin tag's box (pt) is that pin
-# ... or the tag box lies back along its pin line within this many pt (times the drawing scale): the
-# tag covers the outer part of the pin, the drawn pin end can sit where the pin meets the body
-CAD_PIN_REACH = 10.0
+# --------------------------------------------------------------------------- netlist and links inside the PDF
+# Matching a pin the PDF names to a drawn pin end uses the drawing's own tolerances (times the page
+# scale): TOL across the pin line, PIN_RUN_MAX (a pin's length) along it.
+
+
+def _pdfium_dest_point(R, dest, page_height: float) -> Optional[tuple[float, float]]:
+    """The x/y a link or bookmark destination points at (pt, top-left origin); None when it names
+    only the page."""
+    import ctypes
+
+    hx, hy, hz = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+    x, y, z = ctypes.c_float(), ctypes.c_float(), ctypes.c_float()
+    ok = R.FPDFDest_GetLocationInPage(dest, ctypes.byref(hx), ctypes.byref(hy), ctypes.byref(hz),
+                                      ctypes.byref(x), ctypes.byref(y), ctypes.byref(z))
+    if not ok or not (hx.value and hy.value):
+        return None
+    return float(x.value), page_height - float(y.value)
+
+
+def _bookmark_pin(path: list[Optional[str]], lv: int) -> Optional[tuple[str, str, str]]:
+    """(net, part, pin) of a bookmark that lists a pin of a net: <...>/Nets/<net>/[Pins/]<part>-<pin>
+    (also <part>.<pin>), as CAD tools write the netlist into a PDF's outline."""
+    for j in range(lv - 2, -1, -1):
+        if (path[j] or "").strip().lower() != "nets":
+            continue
+        if lv == j + 2 or (lv == j + 3 and (path[j + 2] or "").strip().lower() == "pins"):
+            title = (path[lv] or "").strip()
+            sep = "-" if "-" in title else "."
+            part, _, pin = title.rpartition(sep)
+            if part and pin and path[j + 1]:
+                return path[j + 1].strip(), part, pin
+        return None
+    return None
 
 
 def pdf_cad_pins(pdf_path: str, pages: Optional[Iterable[int]] = None) -> dict[int, list[tuple[str, str, str, tuple]]]:
-    """Page -> [(net name, part, pin, pin box)] of every pin the CAD tool wrote into the PDF itself. An Altium
-    "smart PDF" lists the exact netlist in its bookmarks (<sheet>/Nets/<net>/Pins/<part>-<pin>)
-    and draws an invisible tag PI<part>0<pin> (other non-alphanumerics also written as 0) over
-    each pin, which places every listed pin on its page. Box in pt, top-left origin. Empty when
-    the PDF carries no such netlist."""
+    """Page -> [(net name, part, pin, pin box)] of every pin the PDF itself lists in a netlist in its
+    outline (bookmarks <...>/Nets/<net>/[Pins/]<part>-<pin>). Each pin is placed on its page by an
+    invisible text tag naming it (Altium smart PDF: PI<part>0<pin>, every non-alphanumeric written
+    as 0) or else by the spot its bookmark points at (a zero-size box). Pins with neither are left
+    out. Box in pt, top-left origin. Empty when the PDF carries no such netlist."""
     import ctypes
 
     import pypdfium2 as pdfium
@@ -2527,23 +2565,29 @@ def pdf_cad_pins(pdf_path: str, pages: Optional[Iterable[int]] = None) -> dict[i
     want = set(pages) if pages else None
     enc = lambda s: re.sub(r"[^A-Za-z0-9]", "0", s)  # noqa: E731
     wanted: dict[int, dict[str, tuple[str, str, str]]] = defaultdict(dict)  # page -> tag -> (net, part, pin)
+    points: dict[int, dict[str, tuple]] = defaultdict(dict)  # page -> tag -> point the bookmark shows
     doc = pdfium.PdfDocument(pdf_path)
     try:
         path: list[Optional[str]] = [None] * 16
-        for b in doc.get_toc(max_depth=12):
+        for b in doc.get_toc(max_depth=15):
             lv = b.level
             if lv >= 16:
                 continue
             path[lv] = b.get_title()
-            if lv < 3 or path[lv - 1] != "Pins" or path[lv - 3] != "Nets":
-                continue
-            part, _, pin = path[lv].rpartition("-")
-            dest = b.get_dest()
-            if not part or dest is None:
+            for k in range(lv + 1, 16):
+                path[k] = None
+            hit = _bookmark_pin(path, lv)
+            dest = b.get_dest() if hit else None
+            if dest is None:
                 continue
             pno = dest.get_index() + 1
-            if want is None or pno in want:
-                wanted[pno][f"PI{enc(part)}0{enc(pin)}"] = (path[lv - 2], part, pin)
+            if want is not None and pno not in want:
+                continue
+            tag = f"PI{enc(hit[1])}0{enc(hit[2])}"
+            wanted[pno][tag] = hit
+            pt = _pdfium_dest_point(R, dest.raw, doc[pno - 1].get_height())
+            if pt is not None:
+                points[pno][tag] = pt
         out: dict[int, list[tuple[str, str, str, tuple]]] = {}
         for pno, tags in wanted.items():
             pg = doc[pno - 1]
@@ -2562,6 +2606,9 @@ def pdf_cad_pins(pdf_path: str, pages: Optional[Iterable[int]] = None) -> dict[i
                     seen.add(s)
                     x0, y0, x1, y1 = o.get_bounds()
                     found.append((*tags[s], (x0, H - y1, x1, H - y0)))
+            for tag, (x, y) in points[pno].items():
+                if tag not in seen:
+                    found.append((*tags[tag], (x, y, x, y)))
             tp.close()
             pg.close()
             if found:
@@ -2571,9 +2618,97 @@ def pdf_cad_pins(pdf_path: str, pages: Optional[Iterable[int]] = None) -> dict[i
         doc.close()
 
 
+def pdf_links(pdf_path: str, pages: Optional[Iterable[int]] = None) -> list[tuple[int, tuple, int, Optional[tuple]]]:
+    """Every link of the PDF that jumps to a place inside it: (page, link box, target page, target
+    point or None). Box/point in pt, top-left origin. Links that run a script or open a web page
+    are left out."""
+    import ctypes
+
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as R
+
+    want = set(pages) if pages else None
+    out: list[tuple[int, tuple, int, Optional[tuple]]] = []
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        heights = {}
+        for i in range(len(doc)):
+            pno = i + 1
+            if want is not None and pno not in want:
+                continue
+            pg = doc[i]
+            H = pg.get_height()
+            pos, link = ctypes.c_int(0), R.FPDF_LINK()
+            while R.FPDFLink_Enumerate(pg.raw, ctypes.byref(pos), ctypes.byref(link)):
+                dest = R.FPDFLink_GetDest(doc.raw, link)
+                if not dest:
+                    act = R.FPDFLink_GetAction(link)
+                    if not act or R.FPDFAction_GetType(act) != R.PDFACTION_GOTO:
+                        continue
+                    dest = R.FPDFAction_GetDest(doc.raw, act)
+                    if not dest:
+                        continue
+                di = R.FPDFDest_GetDestPageIndex(doc.raw, dest)
+                if di < 0 or (want is not None and di + 1 not in want):
+                    continue
+                if di not in heights:
+                    heights[di] = doc[di].get_height()
+                r = R.FS_RECTF()
+                if not R.FPDFLink_GetAnnotRect(link, ctypes.byref(r)):
+                    continue
+                box = (min(r.left, r.right), H - max(r.top, r.bottom), max(r.left, r.right), H - min(r.top, r.bottom))
+                out.append((pno, box, di + 1, _pdfium_dest_point(R, dest, heights[di])))
+            pg.close()
+        return out
+    finally:
+        doc.close()
+
+
+def _apply_links(pages: list[PageNetlist], links: list[tuple[int, tuple, int, Optional[tuple]]]) -> dict[str, int]:
+    """Join the nets at both ends of every page link. The link's own end is the one net whose label
+    lies under the link box; its target is the label of the same text nearest the target point
+    text as the link's label -- the nearest label within a connector symbol's span (LOCAL_SPAN); a\n    label of another name only when the point is on it (PIN_GAP).
+    Links that point only at a page, or whose ends are on no net, are navigation and only counted."""
+    by_page = {pn.page: pn for pn in pages}
+    st = Counter()
+    for k, (src, box, dst, pt) in enumerate(links):
+        a, b = by_page.get(src), by_page.get(dst)
+        if a is None or b is None:
+            continue
+        if pt is None:
+            st["page links"] += 1
+            continue
+        tol_a = TOL * a.scale
+        under = {(text, net) for text, net, w in a.labels
+                 if w.x0 <= box[2] + tol_a and w.x1 >= box[0] - tol_a and w.top <= box[3] + tol_a and w.bottom >= box[1] - tol_a}
+        if len({net for _, net in under}) != 1:
+            st["not on a net"] += 1
+            continue
+        texts = {t.upper() for t, _ in under}
+        net_a = next(iter(under))[1]
+        x, y = pt
+        best = None
+        for text, net, w in b.labels:
+            d = _pt_bbox_dist(x, y, w.bbox)
+            same = text.upper() in texts
+            if d <= PIN_GAP * b.scale or (same and d <= LOCAL_SPAN * b.scale):
+                cand = (not same, d, net)
+                if best is None or cand < best:
+                    best = cand
+        if best is None:
+            st["not on a net"] += 1
+            continue
+        key = f"link{k}"
+        a.joins.append((key, net_a))
+        b.joins.append((key, best[2]))
+        st["joined, same name" if not best[0] else "joined, different names"] += 1
+    return dict(st)
+
+
 def _apply_cad_pins(pages: list[PageNetlist], cad: dict[int, list[tuple[str, str, str, tuple]]]) -> dict[str, int]:
-    """Bring the CAD netlist into the drawn netlist. Every drawn pin end inside a pin tag's box is
-    that CAD pin:
+    """Bring the netlist listed in the PDF into the drawn netlist. Every drawn pin end inside a pin's
+    box (+TOL), or with the box back along its own pin line within a pin's length (PIN_RUN_MAX; the
+    box covers the pin's outer part or marks its outer end), is that listed pin:
     * its net gets the CAD net name as a label, so equal names join nets across pages (build_design);
       a drawn net holding pins of DIFFERENT CAD nets (a wire read through a junction it does not
       make) is split, each such pin moving to a net of its own CAD name;
@@ -2587,12 +2722,12 @@ def _apply_cad_pins(pages: list[PageNetlist], cad: dict[int, list[tuple[str, str
         if not boxes:
             continue
         g = Grid(10.0)
-        tol = CAD_PIN_TOL
+        tol = TOL * pn.scale
         for k, (*_x, b) in enumerate(boxes):
             g.add(k, b[0] - tol, b[1] - tol, b[2] + tol, b[3] + tol)
         by_net: dict[int, dict[str, list[Terminal]]] = defaultdict(lambda: defaultdict(list))
         parts_of: dict[int, Counter] = defaultdict(Counter)  # component -> CAD parts of its pins
-        reach = CAD_PIN_REACH * pn.scale
+        reach = PIN_RUN_MAX * pn.scale
         for t in pn.terminals:
             hits = {
                 boxes[k][:3] for k in g.query(t.x, t.y, t.x, t.y)
@@ -2882,17 +3017,29 @@ def extract_design(
         cad = pdf_cad_pins(pdf_path, idxs)
     except Exception as e:  # a damaged outline must never stop the drawing being read
         cad = {}
-        notes.append(f"CAD netlist in the PDF bookmarks could not be read ({e}): nets come from the drawing only")
+        notes.append(f"netlist in the PDF bookmarks could not be read ({e}): nets come from the drawing only")
     if cad:
         n_pins = sum(len(v) for v in cad.values())
         n_nets = len({e[0] for v in cad.values() for e in v})
         st = _apply_cad_pins([done[p] for p in idxs], cad)
         notes.append(
-            f"CAD netlist found in the PDF (bookmarks of an Altium smart PDF): {n_nets} nets, {n_pins} pins; "
-            f"{st.get('matched', 0)} drawn pin ends matched to their CAD pin, {st.get('nets named', 0)} drawn nets named "
-            f"after their CAD net, {st.get('pin numbers set', 0)} pin numbers filled in and {st.get('pin numbers corrected', 0)} "
-            f"corrected, {st.get('parts named', 0)} parts named after their CAD designator"
-            + (f", {st['nets split']} drawn net(s) split because they joined different CAD nets" if st.get("nets split") else "")
+            f"netlist found in the PDF bookmarks: {n_nets} nets, {n_pins} pins placed on their pages; "
+            f"{st.get('matched', 0)} drawn pin ends matched to their listed pin, {st.get('nets named', 0)} drawn nets named "
+            f"after their listed net, {st.get('pin numbers set', 0)} pin numbers filled in and {st.get('pin numbers corrected', 0)} "
+            f"corrected, {st.get('parts named', 0)} parts named after their listed designator"
+            + (f", {st['nets split']} drawn net(s) split because they joined different listed nets" if st.get("nets split") else "")
+        )
+    try:
+        links = pdf_links(pdf_path, idxs)
+    except Exception as e:
+        links = []
+        notes.append(f"links inside the PDF could not be read ({e}): nets come from the drawing only")
+    if links:
+        st = _apply_links([done[p] for p in idxs], links)
+        notes.append(
+            f"links inside the PDF: {len(links)}; {st.get('joined, same name', 0)} join nets of the same name, "
+            f"{st.get('joined, different names', 0)} join nets of different names, "
+            f"{st.get('page links', 0)} only open a page, {st.get('not on a net', 0)} start or end on no net"
         )
     design = build_design([done[p] for p in idxs])
     design.scale = scale or 1.0

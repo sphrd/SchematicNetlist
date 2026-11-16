@@ -110,8 +110,7 @@ def _clean_token(text: str) -> str:
     if len(t) >= 4 and sum(c.isdigit() for c in t) >= 0.75 * len(t):
         return t.translate(_OCR_DIGIT_FIX)
     # an O between two digits is a zero (1O0 -> 100)
-    t = re.sub(r"(?<=\d)O(?=\d)", "0", t)
-    return t
+    return re.sub(r"(?<=\d)O(?=\d)", "0", t)
 
 
 def _text_layer_words(page) -> list[Word]:

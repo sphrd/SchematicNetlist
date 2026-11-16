@@ -50,10 +50,16 @@ The engine works on the **vector drawing** of the PDF, the way every ECAD tool e
   an amplifier triangle, polarity marks) are body, never wires; a small "×" at a wire end is a
   no-connect mark; a short bar with free parallel prongs is a ground symbol drawn in lines;
 * text drawn invisibly (the navigation tags CAD tools hide in their PDF exports) is ignored when the
-  page has visible text; a PDF that carries its CAD netlist in its bookmarks (an Altium "smart PDF")
-  has it read: each listed pin is placed by its hidden tag, and the drawn pin there takes its exact
-  net name (equal names join across pages), pin number and designator; a wire the drawing joined
-  across two CAD nets is split;
+  page has visible text;
+* a netlist the PDF carries in its bookmarks (`.../Nets/<net>/[Pins/]<part>-<pin>`, as an Altium
+  "smart PDF" writes it) is read: each listed pin is placed by its hidden pin tag or by the spot
+  its bookmark points at, and the drawn pin end there (within the drawing's own pin-length and
+  coincidence tolerances, scaled with its text) takes the exact net name (equal names join across
+  pages), pin number and designator; a wire the drawing joined across two listed nets is split;
+* links inside the PDF that jump to a spot on another page (off-page connectors in many CAD
+  exports) join the net under the link with the net at its target: the label of the same name
+  nearest the target, or a label of another name right at it. Links that only open a page
+  (contents, sheet lists) are counted, not used; the log gives the numbers;
 * reference designators, pin numbers, pin names (inside boxes) and net labels are placed by
   position, rotated text included; equal net labels join nets across pages. When the drawing
   prints designators in their own colour, free-form names in that colour (`R_SHUNT_1`,
