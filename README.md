@@ -15,11 +15,15 @@ analysis report. One Windows app, nothing to install; also a Python package with
 1. Download `SchematicNetlist.exe` and double-click it (first start: *More info → Run anyway*,
    the file is not code-signed).
 2. Drop your schematic PDF on the window (or **Browse...**).
-3. Check the **Project name** and the outputs you want, click **Analyze schematic**, then
-   **Open output folder**.
+3. Check the **Project name** and the outputs you want and click **Analyze schematic**. While it
+   reads, a live list under the page count shows what each page is doing and what was found on it
+   (parts, nets, net labels, OCR'd pictures), then the document-wide steps. The *Done* notice's
+   **Open output folder** button (Enter) opens the results in Explorer; **Close** just closes it.
 
 Results go to a folder **named after the project, next to the PDF**. The project name is filled
-in from the PDF name, so by default `Board.pdf` → `Board\`; name it `MyBoard` → `MyBoard\`:
+in from the PDF name, so by default `Board.pdf` → `Board\`; name it `MyBoard` → `MyBoard\`. The full
+path of that folder is shown under the name field. If the folder already exists, the app asks whether
+to **Overwrite** it (files with the same names are replaced, others are kept) or **Change name**:
 
 | File | Content |
 |---|---|
@@ -130,8 +134,7 @@ schematic-netlist-gui
 ```
 
 Pages are read in parallel processes (one per physical core, max 8, fewer when free memory is
-short; the log states the count and why), heaviest pages first so no reader is left alone with
-the biggest page at the end. Every run reads the PDF afresh; nothing is cached (the cache folder of earlier versions,
+short; the log states the count and why), first page to last. Every run reads the PDF afresh; nothing is cached (the cache folder of earlier versions,
 `%LOCALAPPDATA%\SchematicNetlist\cache`, is deleted on the first run, and so is the Tesseract copy
 they unpacked there, `tesseract-*`).
 

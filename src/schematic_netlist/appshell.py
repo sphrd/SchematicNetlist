@@ -356,6 +356,114 @@ class CometSpinner(tk.Label):
         self._job = self.after(16, self._tick)
 
 
+def check_image(size: int, bg: str) -> Image.Image:
+    """The loading log's check mark (`accent` at ~63 % on `bg`), drawn like the splash's."""
+    s = 4
+    img = Image.new("RGB", (size * s, size * s), bg)
+    k = size * s / 14.0
+    pts = [(2.1 * k, 8.05 * k), (5.4 * k, 11.35 * k), (11.45 * k, 3.65 * k)]
+    ImageDraw.Draw(img).line(pts, fill=_mix(bg, TOKENS["accent"], 0.63), width=int(round(1.6 * k)), joint="curve")
+    return img.resize((size, size), Image.LANCZOS)
+
+
+class ActivityLog(tk.Frame):
+    """Live list of what is being worked on, like the splash's loading log: one line per item (a page,
+    or a document-wide step); the current ones with a small trailing-line spinner and `muted` text,
+    finished ones with a check mark and `disabled_fg` text. Shows the latest ``rows`` items; an
+    item's line is updated in place."""
+
+    def __init__(self, parent: tk.Misc, bg: str, rows: int = 8, width: int = 64) -> None:
+        super().__init__(parent, bg=bg)
+        self._bg, self._n = bg, rows
+        key = (12, bg)
+        if key not in CometSpinner._cache:
+            CometSpinner._cache[key] = [ImageTk.PhotoImage(f) for f in comet_frames(12, bg)]
+        self._spin = CometSpinner._cache[key]
+        self._check = ImageTk.PhotoImage(check_image(14, bg))
+        self._blank = ImageTk.PhotoImage(Image.new("RGB", (14, 14), bg))
+        self._rows = []
+        for _ in range(rows):
+            row = tk.Frame(self, bg=bg)
+            row.pack(fill="x", pady=1)
+            icon = tk.Label(row, image=self._blank, bg=bg, bd=0, width=14, height=14)
+            icon.pack(side="left", padx=(0, 6))
+            text = tk.Label(row, text="", bg=bg, fg=TOKENS["muted"], font=("Segoe UI", 9), anchor="w", width=width)
+            text.pack(side="left", fill="x")
+            self._rows.append((icon, text))
+        self._items: dict = {}  # key -> [label, state, text], in the order they started
+        self._doc = 0
+        self._job: Optional[str] = None
+        self._t0 = time.monotonic()
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._doc = 0
+        self._paint()
+
+    def event(self, page: Optional[int], state: str, text: str) -> None:
+        """One engine activity event: a page's line (``Page N: ...``) is updated in place; a
+        document-wide step (page None) opens a line that its next "done" event finishes."""
+        if page is not None:
+            self.update_item(("page", page), f"Page {page}", state, text)
+            return
+        open_key = ("doc", self._doc)
+        is_open = open_key in self._items and self._items[open_key][1] != "done"
+        if state == "done" and is_open:
+            self.update_item(open_key, "", state, text)
+            return
+        if is_open:  # the next step has started: the previous one is finished
+            self._items[open_key][1] = "done"
+        self._doc += 1
+        self.update_item(("doc", self._doc), "", state, text)
+
+    def update_item(self, key, label: str, state: str, text: str) -> None:
+        if key in self._items:
+            self._items[key][1:] = [state, text]
+        else:
+            self._items[key] = [label, state, text]
+        self._paint()
+
+    def _shown(self) -> list:
+        items = list(self._items.values())
+        if len(items) <= self._n:
+            return items
+        # keep every running item in view; finished ones fill the rest, latest first
+        running = [i for i in items if i[1] != "done"][-self._n:]
+        done = [i for i in items if i[1] == "done"]
+        room = self._n - len(running)
+        keep = {id(i) for i in running + (done[-room:] if room > 0 else [])}
+        return [i for i in items if id(i) in keep]
+
+    def _paint(self) -> None:
+        shown = self._shown()
+        for k, (icon, text) in enumerate(self._rows):
+            if k < len(shown):
+                label, state, msg = shown[k]
+                text.configure(text=f"{label}: {msg}" if label else msg,
+                               fg=TOKENS["disabled_fg"] if state == "done" else TOKENS["muted"])
+                if state == "done":
+                    icon.configure(image=self._check)
+            else:
+                text.configure(text="")
+                icon.configure(image=self._blank)
+        if any(s[1] != "done" for s in shown):
+            if self._job is None:
+                self._tick()
+        elif self._job is not None:
+            self.after_cancel(self._job)
+            self._job = None
+
+    def _tick(self) -> None:
+        if not self.winfo_exists():
+            self._job = None
+            return
+        frame = self._spin[int((time.monotonic() - self._t0) * len(self._spin)) % len(self._spin)]
+        for (icon, _t), item in zip(self._rows, self._shown()):
+            if item[1] != "done":
+                icon.configure(image=frame)
+        self._job = self.after(33, self._tick)
+
+
 def progress_image(width: int, fraction: float, t: float, bg: str, height: int = 6, glow_room: int = 0) -> Image.Image:
     """Pill progress bar: `border` track, `accent` fill with a sweep (accent-light, one pass per 1.6 s) gliding
     over the fill."""
@@ -720,6 +828,53 @@ def message(app: tk.Misc, info: AppInfo, ui, heading: str, body: str, title: Opt
     with contextlib.suppress(tk.TclError):
         win.grab_set()
     app.wait_window(win)
+
+
+def finished(app: tk.Misc, info: AppInfo, ui, heading: str, body: str, open_folder: Callable[[], None]) -> None:
+    """Modal result notice whose primary button is **Open output folder** (Enter); **Close** (Escape)
+    just closes it."""
+    win = AppDialog(app, info, ui, f"{info.name} - {heading}")
+
+    def go() -> None:
+        win.destroy()
+        open_folder()
+
+    win.show(heading, body, [("Close", win.destroy), ("Open output folder", go)])
+    win.bind("<Return>", lambda _e: go())
+    with contextlib.suppress(tk.TclError):
+        win.grab_set()
+    app.wait_window(win)
+
+
+def folder_in_use(folder: Path) -> bool:
+    """True when the output folder already exists and holds something."""
+    try:
+        return folder.is_dir() and any(folder.iterdir())
+    except OSError:
+        return False
+
+
+def ask_overwrite(app: tk.Misc, info: AppInfo, ui, folder: Path) -> bool:
+    """The chosen name's output folder already exists: True = overwrite it, False = go back and
+    change the name. **Change name** is the primary button (Enter); Escape also goes back."""
+    win = AppDialog(app, info, ui, f"{info.name} - Folder exists")
+    chosen = [False]
+
+    def overwrite() -> None:
+        chosen[0] = True
+        win.destroy()
+
+    win.show(
+        "Output folder already exists",
+        f"{folder}\n\nOverwrite it with this run's results, or change the name?\n"
+        "Files with the same names are replaced; other files in the folder are kept.",
+        [("Overwrite", overwrite), ("Change name", win.destroy)],
+    )
+    win.bind("<Return>", lambda _e: win.destroy())
+    with contextlib.suppress(tk.TclError):
+        win.grab_set()
+    app.wait_window(win)
+    return chosen[0]
 
 
 class UpdateManager:

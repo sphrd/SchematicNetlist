@@ -262,7 +262,8 @@ def _warn_read_only(path: Path) -> None:
 
 
 class _SpinnerOverlay(tk.Frame):
-    """Full-window busy overlay: spinner, live status text and a Cancel button."""
+    """Full-window busy overlay: spinner, live status text, a live list of what the engine is reading
+    and finding page by page, and a Cancel button."""
 
     def __init__(self, parent: tk.Misc, on_cancel) -> None:
         super().__init__(parent, bg=BG)
@@ -278,10 +279,14 @@ class _SpinnerOverlay(tk.Frame):
             justify="center",
         ).pack()
 
+        self.activity = appshell.ActivityLog(center, BG, rows=8, width=62)
+        self.activity.pack(pady=(14, 0))
+
         _RoundButton(center, "Cancel", on_cancel, width=10).pack(pady=(16, 0))
 
     def show(self) -> None:
         # below the title bar, so the window can still be moved, minimised and closed while busy
+        self.activity.clear()
         self.place(x=0, y=appshell.TITLE_H, relwidth=1, relheight=1, height=-appshell.TITLE_H)
         self.lift()
         self.spinner.start()
@@ -394,12 +399,18 @@ class App(_BaseTk):
 
         tk.Label(form, text="Project name:", **LABEL).grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar()
-        name_box, _ = _boxed(form, tk.Entry, textvariable=self.name_var, **FIELD)
+        name_box, self.name_entry = _boxed(form, tk.Entry, textvariable=self.name_var, **FIELD)
         name_box.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.out_path_label = tk.Label(
+            form, text="", bg=BG, fg=MUTED, font=("Segoe UI", 8), anchor="w", justify="left", wraplength=520,
+        )
+        self.out_path_label.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(2, 0))
+        self.name_var.trace_add("write", lambda *_: self._show_out_path())
+        self._show_out_path()
 
-        tk.Label(form, text="Outputs:", **LABEL).grid(row=1, column=0, sticky="nw", pady=(8, 0))
+        tk.Label(form, text="Outputs:", **LABEL).grid(row=2, column=0, sticky="nw", pady=(8, 0))
         checks = tk.Frame(form, bg=BG)
-        checks.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(8, 0))
+        checks.grid(row=2, column=1, sticky="w", padx=(6, 0), pady=(8, 0))
         self.output_vars = {k: tk.BooleanVar(value=True) for k in OUTPUTS}
         for k in OUTPUTS:
             _Check(checks, OUTPUT_LABELS[k], self.output_vars[k]).pack(anchor="w", pady=1)
@@ -436,6 +447,22 @@ class App(_BaseTk):
         self.log_box.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side="right", fill="y")
         self.log_box.pack(side="left", fill="both", expand=True)
+
+    def _show_out_path(self) -> None:
+        """The folder the run will write, under the name field; flags a name that is taken."""
+        name = self.name_var.get().strip()
+        if self.pdf_path is None:
+            text = "Output folder: choose a PDF first."
+        elif not name:
+            text = "Output folder: enter a project name."
+        elif bad_file_name(name):
+            text = f"Not a valid folder name: {bad_file_name(name)}"
+        else:
+            folder = self.pdf_path.parent / name
+            text = f"Output folder: {folder}"
+            if appshell.folder_in_use(folder):
+                text += "  (already exists -- you'll be asked before it is overwritten)"
+        self.out_path_label.config(text=text)
 
     def _fit_body(self) -> None:
         """Body fills the window when it fits (log takes the slack), otherwise scrolls."""
@@ -484,6 +511,7 @@ class App(_BaseTk):
         self.file_label.config(text=path.name)
         if not self.name_var.get():
             self.name_var.set(path.stem)
+        self._show_out_path()
         self._load_preview(path)
 
     def _load_preview(self, path: Path) -> None:
@@ -524,7 +552,12 @@ class App(_BaseTk):
             _notify("No outputs", "Tick at least one output.")
             return
 
-        self._out_dir = self.pdf_path.parent / name
+        out_dir = self.pdf_path.parent / name
+        if appshell.folder_in_use(out_dir) and not appshell.ask_overwrite(self, APP_INFO, sys.modules[__name__], out_dir):
+            self.name_entry.focus_set()
+            self.name_entry.select_range(0, "end")
+            return
+        self._out_dir = out_dir
         self.run_button.config(state="disabled", text="Working...")
         self.open_folder_button.config(state="disabled")
         self._set_log("")
@@ -549,7 +582,10 @@ class App(_BaseTk):
             def progress(current: int, total: int) -> None:
                 self._queue.put(("progress", f"Reading circuit: {current}/{total} pages done"))
 
-            res = analyze_pdf(pdf_path, name, out_dir, outputs, progress=progress, cancel_check=cancel_event.is_set)
+            res = analyze_pdf(
+                pdf_path, name, out_dir, outputs, progress=progress, cancel_check=cancel_event.is_set,
+                activity=lambda page, state, text: self._queue.put(("activity", (page, state, text))),
+            )
             for line in res.circuit.log:
                 self._log(line)
             for w in res.circuit.warnings:
@@ -569,6 +605,8 @@ class App(_BaseTk):
                     self._append_log(str(payload))
                 elif kind == "progress":
                     self._overlay.set_status(str(payload))
+                elif kind == "activity":
+                    self._overlay.activity.event(*payload)
                 elif kind == "preview":
                     # Keep a reference or Tk shows a blank image.
                     self._preview_img = ImageTk.PhotoImage(payload)
@@ -578,10 +616,11 @@ class App(_BaseTk):
                     self._append_log("\nWrote: " + ", ".join(f.name for f in payload.files))
                     self._reset_buttons()
                     self.open_folder_button.config(state="normal")
-                    _notify(
-                        "Done",
+                    appshell.finished(
+                        self, APP_INFO, sys.modules[__name__], "Done",
                         f"{len(c.parts)} parts and {len(c.nets)} nets found on {len(c.pages)} page(s).\n\n"
                         + "\n".join(f.name for f in payload.files),
+                        self._on_open_folder,
                     )
                 elif kind == "cancelled":
                     self._append_log("\nCancelled by user.")

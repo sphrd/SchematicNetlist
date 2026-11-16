@@ -42,21 +42,30 @@ def analyze_pdf(
     progress: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     workers: Optional[int] = None,
+    activity: Optional[Callable[[Optional[int], str, str], None]] = None,
 ) -> Result:
+    """``activity(page, state, text)``: live view of the engine's work (see extract_design), followed
+    by this module's own steps (page None)."""
     pdf_path, out_dir, outputs = Path(pdf_path), Path(out_dir), set(outputs)
-    design = extract_design(str(pdf_path), pages, progress=progress, cancel_check=cancel_check, workers=workers)
+    say = activity or (lambda *_a: None)
+    design = extract_design(str(pdf_path), pages, progress=progress, cancel_check=cancel_check, workers=workers, activity=activity)
+    say(None, "work", "classifying parts and checking the circuit")
     circuit = build_circuit(design, pdf_path.name)
+    say(None, "done", f"{len(circuit.parts)} parts, {len(circuit.nets)} nets, {len(circuit.warnings)} warnings")
     out_dir.mkdir(parents=True, exist_ok=True)
     res = Result(circuit)
 
     def put(file: Path, text: str) -> None:
         file.write_text(text, encoding="utf-8")
         res.files.append(file)
+        say(None, "done", f"wrote {file.name}")
 
     if "excel" in outputs:
         xlsx = out_dir / f"{name}_analysis.xlsx"
+        say(None, "work", f"writing {xlsx.name}")
         write_report(xlsx, circuit, name)
         res.files.append(xlsx)
+        say(None, "done", f"wrote {xlsx.name}")
     if "spice" in outputs:
         put(out_dir / f"{name}.sp", write_spice(circuit, name))
     if "netlist" in outputs:

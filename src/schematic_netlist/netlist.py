@@ -303,6 +303,37 @@ class Primitives:
     drawn_dots: int = 0  # raster: the first drawn_dots of ``dots`` are filled dots seen in the ink (the rest: snapped wire joints)
 
 
+# --------------------------------------------------------------------------- live activity
+# What the engine is doing right now, for a live view: activity(page, state, text) with page None for
+# document-wide steps, state "work" (in progress) or "done" (finished, text = what it found). Page
+# workers in other processes send it through a queue the main process drains (extract_design).
+_ACTIVITY = None  # callable(page, state, text) in this process, or a multiprocessing queue in a worker
+_PAGE: Optional[int] = None  # page being read by this process
+
+
+def _init_worker(q) -> None:
+    global _ACTIVITY
+    _ACTIVITY = q
+
+
+def _say(text: str, state: str = "work", page: Optional[int] = -1) -> None:
+    sink = _ACTIVITY
+    if sink is None:
+        return
+    pg = _PAGE if page == -1 else page
+    try:
+        if callable(sink):
+            sink(pg, state, text)
+        else:
+            sink.put_nowait((pg, state, text))
+    except Exception:  # a live view must never stop the reading
+        pass
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
 # --------------------------------------------------------------------------- page extraction
 def _color(obj: dict, key: str) -> tuple:
     c = obj.get(key)
@@ -655,12 +686,17 @@ def page_primitives(page, scale: Optional[float] = None, logo_sizes: frozenset =
     from . import image_extract
 
     if image_extract.page_is_raster(page):
+        _say("scanned page: reading wires, symbols and text from the image (OCR)")
         return image_extract.raster_primitives(page)
+    _say("reading the vector drawing and its text")
     prims = vector_primitives(page, scale)
     if image_extract.text_is_outlined(page, prims.words):
+        _say("text drawn as outlines: reading it by OCR")
         prims.words = image_extract.ocr_page_words(page)
         prims.source = "vector+ocr"
-    for bbox in image_extract.image_regions(page, logo_sizes):
+    regions = image_extract.image_regions(page, logo_sizes)
+    for k, bbox in enumerate(regions, 1):
+        _say(f"reading embedded picture {k} of {len(regions)} by OCR")
         try:
             words, kind, rp = image_extract.scan_image_region(page, bbox)
         except Exception as e:  # OCR missing/failed: record the region, never skip it silently
@@ -2489,7 +2525,9 @@ def build_design(pages: list[PageNetlist]) -> Design:
                 elif t.label.upper() not in bad:
                     names_of[t.mark].add(t.label.upper())
     for mark, nodes in anon.items():
-        names = names_of.get(mark, set())
+        # a flag name that no longer labels a net (dropped as ambiguous by an earlier build of the
+        # same pages) names nothing to join
+        names = {n for n in names_of.get(mark, set()) if n in first_by_label}
         if len(names) == 1:
             for nd in nodes:
                 join(first_by_label[next(iter(names))], nd)
@@ -2794,21 +2832,42 @@ def _extract_pages(
     without parsing (or OCR-ing) it again; None for scanned pages, which are never rebuilt."""
     import pdfplumber
 
+    global _PAGE
     out = []
     with pdfplumber.open(pdf_path) as pdf:
         for pno in pnos:
+            _PAGE = pno
             page = pdf.pages[pno - 1]
             prims = page_primitives(page, scale, logo_sizes)
             # (build_page changes the primitives it is given: pickle them first)
             blob = None if prims.source == "raster" else pickle.dumps(prims, protocol=pickle.HIGHEST_PROTOCOL)
-            out.append((build_page(prims, pno, float(page.width), float(page.height), hint), blob))
+            _say(f"tracing nets and parts: {_plural(len(prims.orth), 'wire segment')}, {_plural(len(prims.words), 'word')}")
+            pn = build_page(prims, pno, float(page.width), float(page.height), hint)
+            out.append((pn, blob))
+            _say(_page_summary(pn), "done")
             page.flush_cache()
     return out
 
 
+def _page_summary(pn: PageNetlist) -> str:
+    nets = len(set(pn.seg_net) | {t.net for t in pn.terminals})
+    pics = sum(1 for r in pn.ocr_regions if r[4])
+    return (
+        f"{_plural(len(pn.components), 'part')}, {_plural(nets, 'net')}, {_plural(len(pn.labels), 'net label')}"
+        + (", scanned (OCR)" if pn.source == "raster" else ", text by OCR" if pn.source == "vector+ocr" else "")
+        + (f", {_plural(pics, 'picture')} read by OCR" if pics else "")
+    )
+
+
 def _rebuild_pages(jobs: list[tuple[int, float, float, bytes]], hint: tuple) -> list[PageNetlist]:
     """Worker: rebuild pages from their pickled primitives with another refdes colour hint."""
-    return [build_page(pickle.loads(blob), pno, pw, ph, hint) for pno, pw, ph, blob in jobs]
+    out = []
+    for pno, pw, ph, blob in jobs:
+        _say("reading the designators again in the document's designator colour", page=pno)
+        pn = build_page(pickle.loads(blob), pno, pw, ph, hint)
+        _say(_page_summary(pn), "done", page=pno)
+        out.append(pn)
+    return out
 
 
 def _refdes_color_votes(pages: Iterable[PageNetlist]) -> dict[tuple, int]:
@@ -2889,39 +2948,27 @@ def _stop_pool(pool) -> None:
         p.terminate()
 
 
-def _pdfium_survey(pdf_path: str, idxs: list[int]) -> tuple[dict[int, int], frozenset]:
-    """One fast pdfium pass over the document: a parse-cost weight per page (object count, plus
-    the pixels of embedded images big enough to be OCR'd -- heavy pages are submitted to the pool
-    first so no worker ends up alone with the biggest page), and the pixel sizes of images that
-    repeat across pages (logos/stamps, never OCR'd)."""
+def _pdfium_survey(pdf_path: str, idxs: list[int]) -> frozenset:
+    """One fast pdfium pass over the document: the pixel sizes of embedded images that repeat across
+    pages (logos/stamps, never OCR'd)."""
     import pypdfium2 as pdfium
     import pypdfium2.raw as pdfium_c
 
     from . import image_extract
 
-    weights: dict[int, int] = {}
-    imgs: dict[int, list[tuple[int, int]]] = {}
     size_pages: dict[tuple[int, int], set[int]] = defaultdict(set)
     doc = pdfium.PdfDocument(pdf_path)
     try:
         for pno in idxs:
             page = doc[pno - 1]
-            weights[pno] = pdfium_c.FPDFPage_CountObjects(page)
-            sizes = []
             for obj in page.get_objects(max_depth=4):
                 if obj.type == pdfium_c.FPDF_PAGEOBJ_IMAGE:
                     md = pdfium_c.FPDF_IMAGEOBJ_METADATA()
                     if pdfium_c.FPDFImageObj_GetImageMetadata(obj, page, md):
-                        sizes.append((md.width, md.height))
                         size_pages[(md.width, md.height)].add(pno)
-            imgs[pno] = sizes
     finally:
         doc.close()
-    logos = frozenset(s for s, ps in size_pages.items() if len(ps) >= image_extract.LOGO_MIN_PAGES)
-    for pno, sizes in imgs.items():
-        # an image that will be OCR'd costs like a very object-heavy page: weight it by its pixels
-        weights[pno] += sum(w * h // 20 for w, h in sizes if (w, h) not in logos and w >= 200 and h >= 100)
-    return weights, logos
+    return frozenset(s for s, ps in size_pages.items() if len(ps) >= image_extract.LOGO_MIN_PAGES)
 
 
 def extract_design(
@@ -2930,8 +2977,20 @@ def extract_design(
     progress=None,
     cancel_check=None,
     workers: Optional[int] = None,
+    activity=None,
 ) -> Design:
-    """Netlist of a whole PDF, read afresh every time; pages are read in parallel processes."""
+    """Netlist of a whole PDF, read afresh every time; pages are read in parallel processes.
+    ``activity(page, state, text)`` (optional) is told live what is being read and found, page by
+    page (page None: document-wide steps); it is called from this thread."""
+    global _ACTIVITY
+    _ACTIVITY = activity
+    try:
+        return _extract_design(pdf_path, pages, progress, cancel_check, workers, activity)
+    finally:
+        _ACTIVITY = None
+
+
+def _extract_design(pdf_path, pages, progress, cancel_check, workers, activity) -> Design:
     import pdfplumber
 
     _remove_old_cache()
@@ -2951,12 +3010,13 @@ def extract_design(
         )
     else:
         notes.append(f"extraction: {workers} page reader(s) (requested) for {total} page(s)")
+    _say("finding logos repeated across pages (never OCR'd)", page=None)
+    order = list(idxs)  # first page to last
     try:
-        weights, logos = _pdfium_survey(pdf_path, idxs)
-        order = sorted(idxs, key=lambda p: -weights.get(p, 0))
-    except Exception as e:  # pdfium missing/failed: read in page order, screen no logos
-        logos, order = frozenset(), list(idxs)
-        notes.append(f"pdfium page survey failed ({e}): pages read in order, embedded images not pre-screened")
+        logos = _pdfium_survey(pdf_path, idxs)
+    except Exception as e:  # pdfium missing/failed: screen no logos
+        logos = frozenset()
+        notes.append(f"pdfium image survey failed ({e}): embedded images not pre-screened for logos")
 
     def cancelled() -> None:
         if cancel_check is not None and cancel_check():
@@ -2965,6 +3025,7 @@ def extract_design(
     done: dict[int, PageNetlist] = {}
     blobs: dict[int, bytes] = {}  # page -> pickled primitives, to rebuild it without parsing it again
     if workers <= 1:
+        _say("measuring the drawing scale from the text size", page=None)
         scale = document_scale(pdf_path, idxs)
         for n, pno in enumerate(order, start=1):
             cancelled()
@@ -2981,20 +3042,45 @@ def extract_design(
     else:
         from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
+        events = None
+        if activity is not None:
+            import multiprocessing
+
+            events = multiprocessing.Queue()
+
+        def relay() -> None:
+            """Pass the workers' live activity on to the caller (in this thread)."""
+            while events is not None:
+                try:
+                    pg, state, text = events.get_nowait()
+                except Exception:
+                    return
+                try:
+                    activity(pg, state, text)
+                except Exception:
+                    pass
+
         def results(futs: list):
-            """Results as they complete; checks for cancellation four times a second."""
+            """Results as they complete; checks for cancellation ten times a second."""
             pending = set(futs)
             while pending:
-                finished, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                finished, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                relay()
                 cancelled()
                 for fut in finished:
                     yield fut.result()
+            relay()
 
-        pool = ProcessPoolExecutor(max_workers=workers)
+        pool = (
+            ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(events,))
+            if events is not None
+            else ProcessPoolExecutor(max_workers=workers)
+        )
         try:
-            # one page per task, heaviest first: the pages are balanced over the workers, the big
-            # pages do not pile up at the tail, progress moves page by page and a cancel is seen
-            # at once (opening the PDF again per task costs next to nothing)
+            # one page per task, first page to last (each worker takes the next page when it is free),
+            # progress moves page by page and a cancel is seen at once (opening the PDF again per task
+            # costs next to nothing)
+            _say("measuring the drawing scale from the text size", page=None)
             scale = _scale_of(s for r in results([pool.submit(_page_text_sizes, pdf_path, [p]) for p in _scale_sample(idxs)]) for s in r)
             for res in results([pool.submit(_extract_pages, pdf_path, [p], (), scale, logos) for p in order]):
                 for pn, blob in res:
@@ -3013,6 +3099,7 @@ def extract_design(
             raise
         pool.shutdown()
 
+    _say("reading the netlist in the PDF bookmarks", page=None)
     try:
         cad = pdf_cad_pins(pdf_path, idxs)
     except Exception as e:  # a damaged outline must never stop the drawing being read
@@ -3029,6 +3116,7 @@ def extract_design(
             f"corrected, {st.get('parts named', 0)} parts named after their listed designator"
             + (f", {st['nets split']} drawn net(s) split because they joined different listed nets" if st.get("nets split") else "")
         )
+    _say("following the links inside the PDF", page=None)
     try:
         links = pdf_links(pdf_path, idxs)
     except Exception as e:
@@ -3041,7 +3129,10 @@ def extract_design(
             f"{st.get('joined, different names', 0)} join nets of different names, "
             f"{st.get('page links', 0)} only open a page, {st.get('not on a net', 0)} start or end on no net"
         )
+    _say("joining nets across pages by name", page=None)
     design = build_design([done[p] for p in idxs])
+    n_nets = len({design.gnet(pi, n) for pi, pn in enumerate(design.pages) for n in set(pn.seg_net) | {t.net for t in pn.terminals}})
+    _say(f"{_plural(n_nets, 'net')} over {_plural(len(idxs), 'page')}", "done", page=None)
     design.scale = scale or 1.0
     design.raw_scale = scale
     sample = _scale_sample(idxs)
